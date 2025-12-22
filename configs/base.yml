@@ -1,0 +1,28 @@
+env: paper
+
+exchange:
+  name: bitflyer
+  product_code: FX_BTC_JPY
+  base_url: "https://api.bitflyer.com"
+  ws_url: "wss://ws.lightstream.bitflyer.com/json-rpc"
+
+pybotters:
+  api_label: "bitflyer"
+  timeout_sec: 10
+
+ws:
+  channels:
+    - "lightning_board_snapshot_FX_BTC_JPY"
+    - "lightning_board_FX_BTC_JPY"
+
+strategy:
+  stall_T_ms: 250
+  min_spread_tick: 1
+  ttl_ms: 800
+  max_reverse_ticks: 2
+  size_min: 0.001
+  max_inventory_btc: 0.2
+
+risk:
+  daily_pnl_jpy: -30000
+  max_dd_jpy: -20000

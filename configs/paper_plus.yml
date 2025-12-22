@@ -1,0 +1,15 @@
+env: paper
+
+strategy:
+  # For paper profit exploration:
+  # - inside: quote near bid/ask to "capture" spread in simulated fills
+  quote_mode: inside
+  quote_offset_ticks: 1
+
+  # keep small size while tuning
+  size_min: 0.001
+  max_inventory_btc: 0.05
+
+risk:
+  daily_pnl_jpy: -999999
+  max_dd_jpy: -999999

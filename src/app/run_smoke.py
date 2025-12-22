@@ -1,0 +1,529 @@
+"""
+Near-production smoke test runner.
+
+- Connects WS (board/ticker/executions/child_order_events)
+- Samples board snapshots + logs stall trigger conditions (no strategy orders)
+- Optionally places+cancel a far-from-market tiny order to validate private WS events
+
+Examples:
+    .\\.venv\\Scripts\\python -m src.app.run_smoke --override configs/live.yml --duration-sec 120
+    .\\.venv\\Scripts\\python -m src.app.run_smoke --override configs/live.yml --enable-orders --confirm I_UNDERSTAND
+    .\\.venv\\Scripts\\python -m src.app.run_smoke --override configs/live.yml --simulate-orders --duration-sec 120
+    .\\.venv\\Scripts\\python -m src.app.run_smoke --override configs/live.yml --simulate-orders --simulate-fills --duration-sec 120
+"""
+
+import argparse
+import asyncio
+import time
+from collections import Counter
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+from pathlib import Path
+from secrets import token_hex
+from typing import Optional
+
+from loguru import logger
+
+from src.config.loader import AppConfig, load_app_config
+from src.engine.inventory import PnLTracker
+from src.infra.http_bitflyer import BitflyerHttp
+from src.infra.orderbook_view import OrderBookView
+from src.infra.pyb_session import PyBotterSession
+from src.infra.ws_mux import WsEvent, WsMux
+
+
+def _setup_logging(name: str) -> None:
+    log_dir = Path("logs") / "runtime"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y%m%d-%H%M%S")
+    logger.add(log_dir / f"{name}-{ts}.log", level="INFO", enqueue=True)
+
+
+def _unique(seq: list[str]) -> list[str]:
+    seen: set[str] = set()
+    out: list[str] = []
+    for x in seq:
+        if x in seen:
+            continue
+        seen.add(x)
+        out.append(x)
+    return out
+
+
+def _channels_for(cfg: AppConfig) -> list[str]:
+    pc = cfg.exchange.product_code
+    needed = [
+        f"lightning_board_snapshot_{pc}",
+        f"lightning_board_{pc}",
+        f"lightning_ticker_{pc}",
+        f"lightning_executions_{pc}",
+        "child_order_events",
+    ]
+    return _unique(cfg.ws.channels + needed)
+
+
+@dataclass
+class OrderWsExpect:
+    oid: str
+    expect_execution: bool = False
+    expect_cancel: bool = False
+    seen_order: bool = False
+    seen_execution: bool = False
+    seen_cancel: bool = False
+    deadline_mono: float = 0.0
+
+
+def _iso_z(dt: datetime) -> str:
+    return dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _inject_child_order_events(
+    store,
+    *,
+    items: list[dict],
+) -> None:
+    store.onmessage(
+        {
+            "jsonrpc": "2.0",
+            "method": "channelMessage",
+            "params": {"channel": "child_order_events", "message": items},
+        },
+        None,
+    )
+
+
+def _sim_inject_order(
+    store,
+    *,
+    product_code: str,
+    side: str,
+    price: Decimal,
+    size: Decimal,
+) -> tuple[str, str]:
+    oid = f"SIM-{datetime.now().strftime('%Y%m%d-%H%M%S')}-{token_hex(3)}"
+    child_order_id = f"SIMCO-{token_hex(6)}"
+    now = datetime.now(tz=timezone.utc)
+    expire = now + timedelta(days=365)
+    _inject_child_order_events(
+        store,
+        items=[
+            {
+                "product_code": product_code,
+                "child_order_id": child_order_id,
+                "child_order_acceptance_id": oid,
+                "event_date": _iso_z(now),
+                "event_type": "ORDER",
+                "child_order_type": "LIMIT",
+                "side": side,
+                "price": int(price),
+                "size": float(size),
+                "expire_date": _iso_z(expire),
+            }
+        ],
+    )
+    logger.info(f"SIM ORDER injected {side} @{price} size={size} -> {oid}")
+    return oid, child_order_id
+
+
+async def _sim_cancel_later(
+    store,
+    *,
+    product_code: str,
+    oid: str,
+    child_order_id: str,
+    price: Decimal,
+    size: Decimal,
+    hold_sec: float,
+) -> None:
+    await asyncio.sleep(hold_sec)
+    _inject_child_order_events(
+        store,
+        items=[
+            {
+                "product_code": product_code,
+                "child_order_id": child_order_id,
+                "child_order_acceptance_id": oid,
+                "event_date": _iso_z(datetime.now(tz=timezone.utc)),
+                "event_type": "CANCEL",
+                "price": int(price),
+                "size": float(size),
+            }
+        ],
+    )
+    logger.info(f"SIM CANCEL injected {oid}")
+
+
+async def _sim_exec_later(
+    store,
+    *,
+    product_code: str,
+    oid: str,
+    child_order_id: str,
+    side: str,
+    exec_price: Decimal,
+    exec_size: Decimal,
+    outstanding_size: Decimal,
+    delay_sec: float,
+) -> None:
+    await asyncio.sleep(delay_sec)
+    _inject_child_order_events(
+        store,
+        items=[
+            {
+                "product_code": product_code,
+                "child_order_id": child_order_id,
+                "child_order_acceptance_id": oid,
+                "event_date": _iso_z(datetime.now(tz=timezone.utc)),
+                "event_type": "EXECUTION",
+                "side": side,
+                "price": int(exec_price),
+                "size": float(exec_size),
+                "outstanding_size": float(outstanding_size),
+                "commission": 0.0,
+                "sfd": 0.0,
+            }
+        ],
+    )
+    logger.info(f"SIM EXECUTION injected {side} @{exec_price} size={exec_size} oid={oid}")
+
+
+async def _place_far_order(
+    http: BitflyerHttp,
+    *,
+    side: str,
+    size: Decimal,
+    distance_jpy: Decimal,
+) -> str:
+    board = await http.get_board()
+    mid = Decimal(str(board.get("mid_price")))
+    if side == "BUY":
+        px = max(Decimal(1), mid - distance_jpy)
+    else:
+        px = mid + distance_jpy
+    res = await http.send_limit_order(side=side, price=int(px), size=float(size), tag="smoke")
+    oid = res.get("child_order_acceptance_id")
+    if not oid:
+        raise RuntimeError(f"send_limit_order response missing id: {res}")
+    logger.info(f"ORDER placed {side} @{px} size={size} -> {oid}")
+    return oid
+
+
+async def _cancel_later(http: BitflyerHttp, oid: str, hold_sec: float) -> None:
+    await asyncio.sleep(hold_sec)
+    res = await http.cancel_order(oid)
+    logger.info(f"ORDER cancel requested {oid}: {res}")
+
+
+async def main_async(args: argparse.Namespace) -> None:
+    cfg = load_app_config("configs/base.yml", args.override)
+    _setup_logging("smoke")
+
+    channels = _channels_for(cfg)
+    logger.info(f"cfg.env={cfg.env} product_code={cfg.exchange.product_code}")
+    logger.info(f"subscribing channels={channels}")
+
+    sub_acks: dict[str, bool] = {}
+    all_subscribed = asyncio.Event()
+    child_subscribed = asyncio.Event()
+
+    def on_info(msg: dict) -> None:
+        logger.info(f"WS info {msg}")
+        sub_id = msg.get("id")
+        if isinstance(sub_id, str) and sub_id.startswith("sub:"):
+            sub_acks[sub_id] = bool(msg.get("result") is True)
+            if sub_id == "sub:child_order_events" and msg.get("result") is True:
+                child_subscribed.set()
+            if len(sub_acks) >= len(channels) and all(sub_acks.values()):
+                all_subscribed.set()
+
+    ws_counts: Counter[str] = Counter()
+    ws_channels: Counter[str] = Counter()
+
+    def on_message(msg: dict) -> None:
+        method = msg.get("method") or "no_method"
+        ws_counts[method] += 1
+        params = msg.get("params")
+        if isinstance(params, dict):
+            ch = params.get("channel")
+            if ch:
+                ws_channels[ch] += 1
+
+    if args.enable_orders and args.simulate_orders:
+        raise SystemExit("Choose one: --enable-orders or --simulate-orders")
+
+    if args.simulate_fills and not args.simulate_orders:
+        raise SystemExit("--simulate-fills requires --simulate-orders")
+
+    if args.enable_orders and args.confirm != "I_UNDERSTAND":
+        raise SystemExit("Refusing to place real orders. Pass `--confirm I_UNDERSTAND`.")
+
+    async with PyBotterSession(cfg) as sess:
+        await sess.connect_ws(channels, on_info=on_info, on_message=on_message)
+        store = sess.get_store()
+        http = BitflyerHttp(sess.get_client(), cfg.exchange)
+
+        if args.check_balance:
+            bal = await http.get_balance()
+            if isinstance(bal, list):
+                codes = [row.get("currency_code") for row in bal]
+                logger.info(f"getbalance OK entries={len(bal)} currencies={codes} (amounts hidden)")
+            else:
+                logger.info(f"getbalance OK (non-list): {bal}")
+
+        ob_view = OrderBookView(store, cfg.exchange.product_code, tick_size=Decimal("1"))
+        pnl = PnLTracker()
+        async with WsMux(store, product_code=cfg.exchange.product_code) as mux:
+            end_mono = time.monotonic() + args.duration_sec
+            counts: Counter[str] = Counter()
+            last_summary = time.monotonic()
+            last_collateral_poll = 0.0
+
+            last_eval = 0.0
+            eval_interval = args.eval_interval_ms / 1000.0
+            last_trigger = 0.0
+            trigger_cooldown = 1.0
+            stall_ready = False
+            last_mark: Optional[Decimal] = None
+
+            order_expect: Optional[OrderWsExpect] = None
+            cancel_task: Optional[asyncio.Task] = None
+            exec_task: Optional[asyncio.Task] = None
+            next_order_mono = time.monotonic() + args.order_interval_sec
+            sim_side = args.order_side
+
+            try:
+                await asyncio.wait_for(all_subscribed.wait(), timeout=10)
+            except asyncio.TimeoutError:
+                logger.warning("Not all subscriptions confirmed within 10s; continuing anyway")
+
+            while time.monotonic() < end_mono:
+                now_mono = time.monotonic()
+
+                if args.poll_collateral_sec > 0 and (now_mono - last_collateral_poll) >= args.poll_collateral_sec:
+                    last_collateral_poll = now_mono
+                    col = await http.get_collateral()
+                    logger.info(
+                        f"REAL collateral={col.get('collateral')} open_position_pnl={col.get('open_position_pnl')} "
+                        f"require={col.get('require_collateral')} keep_rate={col.get('keep_rate')}"
+                    )
+
+                if (
+                    (args.enable_orders or args.simulate_orders)
+                    and stall_ready
+                    and order_expect is None
+                    and now_mono >= next_order_mono
+                ):
+                    try:
+                        await asyncio.wait_for(child_subscribed.wait(), timeout=10)
+                    except asyncio.TimeoutError:
+                        logger.warning("child_order_events subscription not confirmed within 10s; proceeding anyway")
+
+                    if args.enable_orders:
+                        active_before = await http.get_child_orders(child_order_state="ACTIVE", count=10)
+                        logger.info(
+                            f"ACTIVE before: {len(active_before) if isinstance(active_before, list) else active_before}"
+                        )
+                        oid = await _place_far_order(
+                            http,
+                            side=args.order_side,
+                            size=Decimal(str(args.order_size_btc)),
+                            distance_jpy=Decimal(str(args.order_distance_jpy)),
+                        )
+                        cancel_task = asyncio.create_task(_cancel_later(http, oid, args.order_hold_sec))
+                        expect_execution = False
+                        expect_cancel = True
+                    else:
+                        snap = ob_view.snapshot(datetime.now(tz=timezone.utc))
+                        if snap.best_bid_price is None or snap.best_ask_price is None:
+                            logger.warning("SIM order skipped: best bid/ask not ready")
+                            next_order_mono = time.monotonic() + 1
+                            continue
+                        mid = (snap.best_bid_price + snap.best_ask_price) / 2
+                        px = (
+                            max(Decimal(1), mid - Decimal(str(args.order_distance_jpy)))
+                            if sim_side == "BUY"
+                            else (mid + Decimal(str(args.order_distance_jpy)))
+                        )
+                        order_size = Decimal(str(args.order_size_btc))
+                        fill_size = order_size * Decimal(str(args.sim_fill_ratio)) if args.simulate_fills else Decimal("0")
+                        fill_size = min(order_size, max(Decimal("0"), fill_size))
+                        remaining = order_size - fill_size
+                        exec_px = snap.best_ask_price if sim_side == "BUY" else snap.best_bid_price
+                        oid, child_order_id = _sim_inject_order(
+                            store,
+                            product_code=cfg.exchange.product_code,
+                            side=sim_side,
+                            price=px,
+                            size=order_size,
+                        )
+                        if args.simulate_fills and fill_size > 0:
+                            exec_task = asyncio.create_task(
+                                _sim_exec_later(
+                                    store,
+                                    product_code=cfg.exchange.product_code,
+                                    oid=oid,
+                                    child_order_id=child_order_id,
+                                    side=sim_side,
+                                    exec_price=exec_px,
+                                    exec_size=fill_size,
+                                    outstanding_size=remaining,
+                                    delay_sec=args.sim_exec_delay_sec,
+                                )
+                            )
+                        if remaining > 0:
+                            cancel_task = asyncio.create_task(
+                                _sim_cancel_later(
+                                    store,
+                                    product_code=cfg.exchange.product_code,
+                                    oid=oid,
+                                    child_order_id=child_order_id,
+                                    price=px,
+                                    size=remaining,
+                                    hold_sec=args.order_hold_sec,
+                                )
+                            )
+                        expect_execution = args.simulate_fills and fill_size > 0
+                        expect_cancel = remaining > 0
+                        if args.sim_side_mode == "alternate":
+                            sim_side = "SELL" if sim_side == "BUY" else "BUY"
+
+                    order_expect = OrderWsExpect(
+                        oid=oid,
+                        expect_execution=expect_execution,
+                        expect_cancel=expect_cancel,
+                        deadline_mono=time.monotonic() + args.order_ws_timeout_sec,
+                    )
+                    next_order_mono = time.monotonic() + args.order_interval_sec
+
+                try:
+                    evt: WsEvent = await mux.get(timeout=1)
+                except asyncio.TimeoutError:
+                    evt = None  # type: ignore[assignment]
+
+                if evt is not None:
+                    counts[evt.kind] += 1
+
+                    if evt.kind == "board":
+                        if now_mono - last_eval >= eval_interval:
+                            last_eval = now_mono
+                            snap = ob_view.snapshot(datetime.now(tz=timezone.utc))
+                            spread_ok = (
+                                snap.spread_ticks is not None
+                                and snap.spread_ticks >= cfg.strategy.min_spread_tick
+                            )
+                            age_ok = snap.best_age_ms >= cfg.strategy.stall_T_ms
+                            stall_ready = age_ok and spread_ok
+                            if snap.best_bid_price is not None and snap.best_ask_price is not None:
+                                last_mark = (snap.best_bid_price + snap.best_ask_price) / 2
+                                pnl.update_mark(last_mark)
+                            if age_ok and spread_ok and (now_mono - last_trigger) >= trigger_cooldown:
+                                last_trigger = now_mono
+                                logger.info(
+                                    "STALL trigger "
+                                    f"age_ms={snap.best_age_ms} spread_ticks={snap.spread_ticks} "
+                                    f"bid={snap.best_bid_price} ask={snap.best_ask_price}"
+                                )
+
+                    elif evt.kind == "child_order_events":
+                        if order_expect and evt.data.get("child_order_acceptance_id") == order_expect.oid:
+                            et = evt.data.get("event_type")
+                            logger.info(f"child_order_events {evt.operation}: {evt.data}")
+                            if et == "ORDER":
+                                order_expect.seen_order = True
+                            elif et == "EXECUTION":
+                                order_expect.seen_execution = True
+                                try:
+                                    pnl.apply_execution(
+                                        side=str(evt.data.get("side")),
+                                        price=Decimal(str(evt.data.get("price"))),
+                                        size=Decimal(str(evt.data.get("size"))),
+                                    )
+                                except Exception as e:
+                                    logger.warning(f"PnL apply_execution failed: {e} evt={evt.data}")
+                            elif et == "CANCEL":
+                                order_expect.seen_cancel = True
+
+                if order_expect and now_mono >= order_expect.deadline_mono:
+                    logger.warning(
+                        f"child_order_events timeout for {order_expect.oid}: "
+                        f"ORDER={order_expect.seen_order} EXEC={order_expect.seen_execution} CANCEL={order_expect.seen_cancel}"
+                    )
+                    order_expect = None
+
+                if order_expect and order_expect.seen_order:
+                    if order_expect.expect_execution and not order_expect.seen_execution:
+                        pass
+                    elif order_expect.expect_cancel and not order_expect.seen_cancel:
+                        pass
+                    else:
+                        if args.enable_orders:
+                            active_after = await http.get_child_orders(child_order_state="ACTIVE", count=10)
+                            logger.info(
+                                f"ACTIVE after: {len(active_after) if isinstance(active_after, list) else active_after}"
+                            )
+                        st = pnl.state
+                        logger.info(
+                            f"child_order_events OK for {order_expect.oid} "
+                            f"SIM_PNL pos={st.position_btc} avg={st.avg_price} mark={st.mark_price} "
+                            f"realized={st.realized_pnl_jpy} unrealized={st.unrealized_pnl_jpy} total={st.total_pnl_jpy}"
+                        )
+                        order_expect = None
+
+                if now_mono - last_summary >= args.summary_interval_sec:
+                    last_summary = now_mono
+                    st = pnl.state
+                    logger.info(
+                        f"summary events={dict(counts)} ws_methods={dict(ws_counts)} ws_channels={dict(ws_channels)} "
+                        f"SIM_PNL pos={st.position_btc} avg={st.avg_price} mark={st.mark_price} "
+                        f"realized={st.realized_pnl_jpy} unrealized={st.unrealized_pnl_jpy} total={st.total_pnl_jpy}"
+                    )
+
+            if exec_task:
+                await asyncio.gather(exec_task, return_exceptions=True)
+            if cancel_task:
+                await asyncio.gather(cancel_task, return_exceptions=True)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--override", default="configs/live.yml")
+    parser.add_argument("--duration-sec", type=int, default=120)
+    parser.add_argument("--summary-interval-sec", type=int, default=10)
+    parser.add_argument("--eval-interval-ms", type=int, default=50)
+    parser.add_argument("--poll-collateral-sec", type=int, default=30)
+
+    parser.add_argument("--check-balance", action="store_true")
+
+    parser.add_argument("--enable-orders", action="store_true")
+    parser.add_argument(
+        "--simulate-orders",
+        action="store_true",
+        help="Inject pseudo child_order_events into the local DataStore (no real orders)",
+    )
+    parser.add_argument("--simulate-fills", action="store_true", help="Also inject EXECUTION for simulated orders")
+    parser.add_argument("--sim-fill-ratio", type=float, default=0.5, help="Fill ratio (0..1) for simulated orders")
+    parser.add_argument("--sim-exec-delay-sec", type=float, default=0.2)
+    parser.add_argument(
+        "--sim-side-mode",
+        choices=["fixed", "alternate"],
+        default="fixed",
+        help="fixed: always use --order-side, alternate: flip BUY/SELL each simulated order",
+    )
+    parser.add_argument("--confirm", default="")
+    parser.add_argument("--order-side", choices=["BUY", "SELL"], default="BUY")
+    parser.add_argument("--order-size-btc", type=float, default=0.001)
+    parser.add_argument("--order-distance-jpy", type=int, default=2_000_000)
+    parser.add_argument("--order-hold-sec", type=float, default=2.0)
+    parser.add_argument("--order-interval-sec", type=int, default=60)
+    parser.add_argument("--order-ws-timeout-sec", type=int, default=20)
+
+    args = parser.parse_args()
+    try:
+        asyncio.run(main_async(args))
+    except KeyboardInterrupt:
+        return
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,10 @@
+env: paper
+
+strategy:
+  # More realistic quoting (touch / inside-spread) than mid±1 when spread is wide.
+  quote_mode: inside
+  quote_offset_ticks: 0
+
+risk:
+  daily_pnl_jpy: -999999
+  max_dd_jpy: -999999

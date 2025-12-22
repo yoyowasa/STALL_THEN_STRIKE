@@ -1,0 +1,9 @@
+env: paper
+
+strategy:
+  size_min: 0.001
+  max_inventory_btc: 0.05
+
+risk:
+  daily_pnl_jpy: -999999
+  max_dd_jpy: -999999

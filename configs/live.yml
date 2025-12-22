@@ -1,0 +1,10 @@
+env: live
+
+# 必要なら本番用のリスク/ロットを上書き
+strategy:
+  size_min: 0.001
+  max_inventory_btc: 0.2
+
+risk:
+  daily_pnl_jpy: -30000
+  max_dd_jpy: -20000

@@ -1,0 +1,10 @@
+env: paper
+
+strategy:
+  quote_mode: inside
+  quote_offset_ticks: 0
+  max_reverse_ticks: 999999
+
+risk:
+  daily_pnl_jpy: -999999
+  max_dd_jpy: -999999
