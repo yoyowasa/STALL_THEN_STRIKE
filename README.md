@@ -16,3 +16,4 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - `data/` … 生データや結果を残したい場合の置き場
 
 詳細なアーキテクチャとログ設計は `DESIGN.md` を参照してください。
+# STALL_THEN_STRIKE
