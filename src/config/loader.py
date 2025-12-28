@@ -28,6 +28,8 @@ class StallStrategyConfig(BaseModel):
     min_spread_tick: int
     ttl_ms: int
     max_reverse_ticks: int
+    ca_ratio_win_ms: int = 500  # Cancel/Add比を数える移動窓（ミリ秒）
+    ca_threshold: float = 1.3   # C/A比の上限（これ以下のときだけ発注を許可）
     quote_mode: str = Field(default="mid")  # mid|inside
     quote_offset_ticks: int = Field(default=1)
     size_min: float

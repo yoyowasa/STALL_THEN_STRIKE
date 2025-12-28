@@ -3,10 +3,14 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+import time  # 何をするimportか：C/A比の窓（ms）を動かすために現在時刻msを作る
 from typing import Optional
+
+from loguru import logger
 
 from src.config.loader import StallStrategyConfig
 from src.engine.inventory import FillEvent, InventoryManager
+from src.features.cancel_add_ratio import CancelAddRatio  # 何をするimportか：Best層のCancel/Add比を計算する部品を使う
 from src.types.dto import Action, BoardSnapshot, Side
 
 
@@ -43,6 +47,8 @@ class StallThenStrikeStrategy:
         tag: str = "stall",
     ) -> None:
         self.cfg = cfg
+        self._ca = CancelAddRatio(win_ms=self.cfg.ca_ratio_win_ms)  # 何をするコードか：直近win_msのBest層C/A比を計算する状態を初期化する
+        self._ca_last_log_ms = 0  # 何をするコードか：C/Aゲートの状態ログを1秒に1回だけ出すための前回ログ時刻(ms)を持つ
         self.tick_size = tick_size
         self.inventory = inventory
         self.tag = tag
@@ -112,8 +118,40 @@ class StallThenStrikeStrategy:
     def on_board(self, board: BoardSnapshot, *, now: datetime) -> tuple[list[Action], DecisionMeta]:
         actions: list[Action] = []
 
-        if board.best_bid_price is not None and board.best_ask_price is not None:
-            mark = (board.best_bid_price + board.best_ask_price) / 2
+        best_bid_price = board.best_bid_price
+        best_bid_size = board.best_bid_size
+        best_ask_price = board.best_ask_price
+        best_ask_size = board.best_ask_size
+
+        now_ms = int(time.time() * 1000)  # 何をするコードか：C/A比のローリング窓のための現在時刻(ms)を作る
+        if (
+            best_bid_price is not None
+            and best_bid_size is not None
+            and best_ask_price is not None
+            and best_ask_size is not None
+        ):
+            self._ca.update(
+                ts_ms=now_ms,
+                best_bid_price=float(best_bid_price),
+                best_bid_size=float(best_bid_size),
+                best_ask_price=float(best_ask_price),
+                best_ask_size=float(best_ask_size),
+            )  # 何をするコードか：Best層の変化を取り込み、直近win_msのCancel/Add比を更新する
+
+        add_sum, cancel_sum, _ = self._ca.snapshot()
+        # Cancel/Add比は「add=0」の窓だと評価不能なので、ゼロ割りを避けて ALLOW 扱いにする
+        ratio = (cancel_sum / add_sum) if add_sum > 0 else 0.0  # add=0 のとき ratio=inf にしない（誤ブロック防止）
+
+        if now_ms - self._ca_last_log_ms >= 1000:  # 何をするコードか：ログを毎ティック出さず、1秒に1回だけに絞る
+            state = "ALLOW" if ratio <= self.cfg.ca_threshold else "BLOCK"  # 何をするコードか：しきい値以内なら発注可、超えたらブロックと判定する
+            print(  # 何をするコードか：C/Aゲートの“今”を実行ログに出して、効いているか確認できるようにする
+                f"ca_gate state={state} win_ms={self.cfg.ca_ratio_win_ms} "
+                f"thr={self.cfg.ca_threshold} add={add_sum} cancel={cancel_sum} ratio={ratio}"
+            )
+            self._ca_last_log_ms = now_ms  # 何をするコードか：今回ログを出した時刻を保存する
+
+        if best_bid_price is not None and best_ask_price is not None:
+            mark = (best_bid_price + best_ask_price) / 2
             self.inventory.update_mark(mark)
 
         inv = self.inventory.state
@@ -136,6 +174,14 @@ class StallThenStrikeStrategy:
                 inventory_btc=self.inventory.position_btc,
             )
             return actions, meta
+
+        ca_ratio = ratio
+        ca_blocked = ca_ratio > self.cfg.ca_threshold
+        if ca_blocked and self._open:
+            logger.info(
+                f"CA gate cancel_all ratio={ca_ratio:.4f} threshold={self.cfg.ca_threshold:.4f}"
+            )
+            self._append_cancel_once(actions)
 
         cancel_due = bool(self._orders_until and now >= self._orders_until and self._open)
 
@@ -223,6 +269,21 @@ class StallThenStrikeStrategy:
         inv_ok = inv.size < Decimal(str(self.cfg.max_inventory_btc))
 
         if stall_ready and inv_ok and not self._open:
+            if ca_blocked:
+                logger.info(
+                    f"CA gate entry_blocked ratio={ca_ratio:.4f} threshold={self.cfg.ca_threshold:.4f}"
+                )
+                meta = DecisionMeta(
+                    ts=now,
+                    decision_type="idle",
+                    reason="ca_gate_ratio_high",
+                    actions=actions,
+                    best_age_ms=board.best_age_ms,
+                    spread_ticks=board.spread_ticks,
+                    inventory_btc=self.inventory.position_btc,
+                )
+                return actions, meta
+
             bid = board.best_bid_price
             ask = board.best_ask_price
             mid = (bid + ask) / 2

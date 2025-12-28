@@ -1,0 +1,6 @@
+env: paper
+
+strategy:
+  size_min: 0.001
+  max_inventory_btc: 0.05
+  ca_threshold: 0.0
