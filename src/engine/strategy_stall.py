@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+import os  # 【ABガード】環境変数で「期待するca_threshold」を受け取るため
 import time  # 何をするimportか：C/A比の窓（ms）を動かすために現在時刻msを作る
 from typing import Optional
 
@@ -48,7 +49,28 @@ class StallThenStrikeStrategy:
     ) -> None:
         self.cfg = cfg
         self._ca = CancelAddRatio(win_ms=self.cfg.ca_ratio_win_ms)  # 何をするコードか：直近win_msのBest層C/A比を計算する状態を初期化する
+        expected_thr = os.getenv("AB_EXPECT_CA_THRESHOLD")  # 【ABガード】このランで期待するca_threshold（例: "1.3" / "999"）を外から渡す
+        actual_thr = float(self.cfg.ca_threshold)  # 【ABガード】実際に読み込まれたca_threshold（ログと判定の唯一の真実）
+        actual_win_ms = int(self.cfg.ca_ratio_win_ms)  # 【ABガード】実際に読み込まれた窓（ms）
+
+        logger.info(
+            "ca_gate_config win_ms={} thr={} expected_thr={}",
+            actual_win_ms,
+            actual_thr,
+            expected_thr,
+        )  # 【可観測性】paper本体ログに残す
+        print(
+            f"ca_gate_config win_ms={actual_win_ms} thr={actual_thr} expected_thr={expected_thr}"
+        )  # 【可観測性】ca_gate_stdout にも同じ内容を残す
+
+        if expected_thr is not None and abs(float(expected_thr) - actual_thr) > 1e-12:  # 【ABガード】想定と違う設定なら、比較が壊れるので即停止
+            raise RuntimeError(
+                f"AB_EXPECT_CA_THRESHOLD mismatch: expected={expected_thr} actual={actual_thr}"
+            )  # 【ABガード】無駄な600秒を回さない
         self._ca_last_log_ms = 0  # 何をするコードか：C/Aゲートの状態ログを1秒に1回だけ出すための前回ログ時刻(ms)を持つ
+        self._ca_gate_total = 0
+        self._ca_gate_allow = 0
+        self._ca_gate_block = 0
         self.tick_size = tick_size
         self.inventory = inventory
         self.tag = tag
@@ -69,6 +91,10 @@ class StallThenStrikeStrategy:
     @property
     def open_order_count(self) -> int:
         return len(self._open)
+
+    @property
+    def ca_gate_stats(self) -> tuple[int, int, int]:
+        return self._ca_gate_total, self._ca_gate_allow, self._ca_gate_block
 
     def on_order_event(self, evt: dict, *, now: datetime) -> None:
         tag = str(evt.get("tag") or "")
@@ -144,6 +170,11 @@ class StallThenStrikeStrategy:
 
         if now_ms - self._ca_last_log_ms >= 1000:  # 何をするコードか：ログを毎ティック出さず、1秒に1回だけに絞る
             state = "ALLOW" if ratio <= self.cfg.ca_threshold else "BLOCK"  # 何をするコードか：しきい値以内なら発注可、超えたらブロックと判定する
+            self._ca_gate_total += 1
+            if state == "ALLOW":
+                self._ca_gate_allow += 1
+            else:
+                self._ca_gate_block += 1
             print(  # 何をするコードか：C/Aゲートの“今”を実行ログに出して、効いているか確認できるようにする
                 f"ca_gate state={state} win_ms={self.cfg.ca_ratio_win_ms} "
                 f"thr={self.cfg.ca_threshold} add={add_sum} cancel={cancel_sum} ratio={ratio}"

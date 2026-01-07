@@ -3,7 +3,7 @@ env: paper
 strategy:
   size_min: 0.001
   max_inventory_btc: 0.05
-  ca_threshold: 999  # 何をする設定か：C/A比ゲートを実質OFF（しきい値超えでほぼBLOCKしない）
+  ca_threshold: 1.25  # Cancel/Add Gate：cancel/add がこの値より大きいと BLOCK
   ca_ratio_win_ms: 2000  # Cancel/Add比の集計窓(ms)。判定を安定させるため長めにする
 
 risk:

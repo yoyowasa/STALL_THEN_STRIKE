@@ -128,6 +128,7 @@ async def _run_trade(
         last_decision_type: Optional[str] = None
 
         last_snap: Optional[BoardSnapshot] = None
+        trade_count = 0
 
         def _evt_ts(data: dict) -> datetime:
             v = data.get("event_date")
@@ -139,6 +140,7 @@ async def _run_trade(
             return datetime.now(tz=timezone.utc)
 
         def handle_child_event(data: dict) -> None:
+            nonlocal trade_count
             ts = _evt_ts(data)
             strategy.on_order_event(data, now=ts)
             if data.get("event_type") != "EXECUTION":
@@ -153,6 +155,7 @@ async def _run_trade(
             )
             inventory.apply_fill(fill)
             strategy.on_fill(fill)
+            trade_count += 1
             st = inventory.pnl.state
             logger.info(
                 f"FILL {fill.side} @{fill.price} size={fill.size} oid={fill.order_id} "
@@ -261,6 +264,12 @@ async def _run_trade(
                 f"open_orders_before={open0} open_orders_after={strategy.open_order_count} "
                 f"active_orders_before={active0} active_orders_after={len(executor.active_orders)} "
                 f"pnl_before={pnl0} pnl_after={pnl1}"
+            )
+            ca_total, ca_allow, ca_block = strategy.ca_gate_stats
+            block_rate = (ca_block / ca_total) if ca_total else 0
+            logger.info(f"trades={trade_count}")
+            logger.info(
+                f"ca_gate total={ca_total} allow={ca_allow} block={ca_block} block_rate={block_rate}"
             )
 
 

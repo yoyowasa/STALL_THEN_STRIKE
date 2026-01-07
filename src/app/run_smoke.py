@@ -15,13 +15,15 @@ Examples:
 import argparse
 import asyncio
 import time
+import subprocess
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from secrets import token_hex
-from typing import Optional
+from typing import Optional, Callable
+from typing import Any
 
 from loguru import logger
 
@@ -38,6 +40,12 @@ def _setup_logging(name: str) -> None:
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
     logger.add(log_dir / f"{name}-{ts}.log", level="INFO", enqueue=True)
+
+def _git_rev() -> str:
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return "unknown"
 
 
 def _unique(seq: list[str]) -> list[str]:
@@ -61,6 +69,48 @@ def _channels_for(cfg: AppConfig) -> list[str]:
         "child_order_events",
     ]
     return _unique(cfg.ws.channels + needed)
+
+def rollout_entry_gate_summary(
+    *,
+    consistency_ok_consecutive: Optional[int],
+    cooldown_remaining_sec: Optional[float],
+    mismatch_size_last: Optional[float],
+    event_latency_ms_p99: Optional[float],
+    queue_depth_max: Optional[int],
+    ca_gate_win_ms: Optional[int],
+    ca_gate_thr: Optional[float],
+    ca_gate_total: Optional[int],
+    ca_gate_allow: Optional[int],
+    ca_gate_block: Optional[int],
+    ca_gate_block_rate: Optional[float],
+    end_pos: Decimal,
+    active_count_end: Optional[int],
+    major_alerts: int,
+    cfg_rev: str,
+    cfg_files: list[str],
+    mode: str,
+) -> None:
+    def _fmt(v: Optional[object]) -> str:
+        return "na" if v is None else str(v)
+
+    block_rate = ca_gate_block_rate
+    if block_rate is None and ca_gate_total is not None and ca_gate_total > 0 and ca_gate_block is not None:
+        block_rate = ca_gate_block / ca_gate_total
+    block_rate_str = "na" if block_rate is None else f"{block_rate:.6f}"
+
+    logger.info(
+        "rollout_entry_gate_summary "
+        f"consistency_ok_consecutive={_fmt(consistency_ok_consecutive)} "
+        f"cooldown_remaining_sec={_fmt(cooldown_remaining_sec)} "
+        f"mismatch_size_last={_fmt(mismatch_size_last)} "
+        f"event_latency_ms_p99={_fmt(event_latency_ms_p99)} "
+        f"queue_depth_max={_fmt(queue_depth_max)} "
+        f"ca_gate(win_ms={_fmt(ca_gate_win_ms)}, thr={_fmt(ca_gate_thr)}) "
+        f"ca_gate_block_rate={block_rate_str} "
+        f"ca_gate_total={_fmt(ca_gate_total)} ca_gate_allow={_fmt(ca_gate_allow)} ca_gate_block={_fmt(ca_gate_block)} "
+        f"end_pos={end_pos} active_count_end={_fmt(active_count_end)} "
+        f"major_alerts={major_alerts} cfg_rev={cfg_rev} cfg_files={cfg_files} mode={mode}"
+    )
 
 
 @dataclass
@@ -209,15 +259,63 @@ async def _place_far_order(
     return oid
 
 
-async def _cancel_later(http: BitflyerHttp, oid: str, hold_sec: float) -> None:
+async def _cancel_later(
+    http: BitflyerHttp,
+    oid: str,
+    hold_sec: float,
+    *,
+    poll_sec: float,
+    poll_interval_sec: float,
+    log_warn: Optional[Callable[[str], None]] = None,
+) -> None:
     await asyncio.sleep(hold_sec)
     res = await http.cancel_order(oid)
     logger.info(f"ORDER cancel requested {oid}: {res}")
+    if poll_sec <= 0:
+        return
+    deadline = time.monotonic() + poll_sec
+    last_count = None
+    last_hit = None
+    def _warn(msg: str) -> None:
+        if log_warn:
+            log_warn(msg)
+        else:
+            logger.warning(msg)
+    while True:
+        try:
+            orders = await http.get_child_orders(child_order_state="ACTIVE", count=50)
+        except Exception as e:
+            _warn(f"ACTIVE poll error oid={oid}: {e}")
+            orders = None
+        if isinstance(orders, list):
+            last_count = len(orders)
+            last_hit = len([o for o in orders if o.get("child_order_acceptance_id") == oid])
+            logger.info(f"ACTIVE poll count={last_count} hit={last_hit} oid={oid}")
+            if last_hit == 0:
+                break
+        else:
+            logger.info(f"ACTIVE poll response oid={oid}: {orders}")
+        if time.monotonic() >= deadline:
+            break
+        await asyncio.sleep(poll_interval_sec)
+    if last_count is not None and last_hit is not None:
+        logger.info(f"ACTIVE poll final count={last_count} hit={last_hit} oid={oid}")
 
 
 async def main_async(args: argparse.Namespace) -> None:
     cfg = load_app_config("configs/base.yml", args.override)
     _setup_logging("smoke")
+
+    major_alerts = 0
+    def warn(msg: str) -> None:
+        nonlocal major_alerts
+        major_alerts += 1
+        logger.warning(msg)
+
+    cfg_rev = args.cfg_rev or _git_rev()
+    cfg_files = ["configs/base.yml"]
+    if args.override:
+        cfg_files.append(args.override)
 
     channels = _channels_for(cfg)
     logger.info(f"cfg.env={cfg.env} product_code={cfg.exchange.product_code}")
@@ -295,7 +393,7 @@ async def main_async(args: argparse.Namespace) -> None:
             try:
                 await asyncio.wait_for(all_subscribed.wait(), timeout=10)
             except asyncio.TimeoutError:
-                logger.warning("Not all subscriptions confirmed within 10s; continuing anyway")
+                warn("Not all subscriptions confirmed within 10s; continuing anyway")
 
             while time.monotonic() < end_mono:
                 now_mono = time.monotonic()
@@ -317,7 +415,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     try:
                         await asyncio.wait_for(child_subscribed.wait(), timeout=10)
                     except asyncio.TimeoutError:
-                        logger.warning("child_order_events subscription not confirmed within 10s; proceeding anyway")
+                        warn("child_order_events subscription not confirmed within 10s; proceeding anyway")
 
                     if args.enable_orders:
                         active_before = await http.get_child_orders(child_order_state="ACTIVE", count=10)
@@ -330,13 +428,22 @@ async def main_async(args: argparse.Namespace) -> None:
                             size=Decimal(str(args.order_size_btc)),
                             distance_jpy=Decimal(str(args.order_distance_jpy)),
                         )
-                        cancel_task = asyncio.create_task(_cancel_later(http, oid, args.order_hold_sec))
+                        cancel_task = asyncio.create_task(
+                            _cancel_later(
+                                http,
+                                oid,
+                                args.order_hold_sec,
+                                poll_sec=args.post_cancel_poll_sec,
+                                poll_interval_sec=args.post_cancel_poll_interval_sec,
+                                log_warn=warn,
+                            )
+                        )
                         expect_execution = False
                         expect_cancel = True
                     else:
                         snap = ob_view.snapshot(datetime.now(tz=timezone.utc))
                         if snap.best_bid_price is None or snap.best_ask_price is None:
-                            logger.warning("SIM order skipped: best bid/ask not ready")
+                            warn("SIM order skipped: best bid/ask not ready")
                             next_order_mono = time.monotonic() + 1
                             continue
                         mid = (snap.best_bid_price + snap.best_ask_price) / 2
@@ -440,12 +547,12 @@ async def main_async(args: argparse.Namespace) -> None:
                                         size=Decimal(str(evt.data.get("size"))),
                                     )
                                 except Exception as e:
-                                    logger.warning(f"PnL apply_execution failed: {e} evt={evt.data}")
+                                    warn(f"PnL apply_execution failed: {e} evt={evt.data}")
                             elif et == "CANCEL":
                                 order_expect.seen_cancel = True
 
                 if order_expect and now_mono >= order_expect.deadline_mono:
-                    logger.warning(
+                    warn(
                         f"child_order_events timeout for {order_expect.oid}: "
                         f"ORDER={order_expect.seen_order} EXEC={order_expect.seen_execution} CANCEL={order_expect.seen_cancel}"
                     )
@@ -478,11 +585,159 @@ async def main_async(args: argparse.Namespace) -> None:
                         f"SIM_PNL pos={st.position_btc} avg={st.avg_price} mark={st.mark_price} "
                         f"realized={st.realized_pnl_jpy} unrealized={st.unrealized_pnl_jpy} total={st.total_pnl_jpy}"
                     )
+                    env = dict(locals())
+                    # ENTRY_GUARD が参照するキーに「実体」を必ず入れて、None 判定を防ぐ
+                    env["cfg"] = cfg.strategy
+                    ca_gate_block_rate = args.ca_gate_block_rate
+                    if (
+                        ca_gate_block_rate is None
+                        and args.ca_gate_total
+                        and args.ca_gate_block is not None
+                    ):
+                        ca_gate_block_rate = args.ca_gate_block / args.ca_gate_total
+                    env["engine"] = {
+                        "health": {
+                            "consistency_ok_consecutive": args.consistency_ok_consecutive,
+                            "cooldown_remaining_sec": args.cooldown_remaining_sec,
+                        },
+                        "metrics": {
+                            "event_latency_ms_p99": args.event_latency_ms_p99,
+                            "queue_depth_max": args.queue_depth_max,
+                            "ca_gate_block_rate": ca_gate_block_rate,
+                        },
+                    }
+                    env["strategy"] = {"cfg": cfg.strategy}
+                    active_after = env.get("active_after")
+                    if isinstance(active_after, list):
+                        env["active_after"] = len(active_after)
+                    else:
+                        env["active_after"] = active_after
+                    env["errors"] = major_alerts
+                    _emit_entry_guard(logger, env)
 
             if exec_task:
                 await asyncio.gather(exec_task, return_exceptions=True)
             if cancel_task:
                 await asyncio.gather(cancel_task, return_exceptions=True)
+            end_pos = pnl.state.position_btc
+            active_count_end = None
+            try:
+                orders = await http.get_child_orders(child_order_state="ACTIVE", count=50)
+                if isinstance(orders, list):
+                    active_count_end = len(orders)
+                    logger.info(f"ACTIVE final count={active_count_end}")
+                else:
+                    logger.info(f"ACTIVE final response: {orders}")
+            except Exception as e:
+                warn(f"ACTIVE final error: {e}")
+            rollout_entry_gate_summary(
+                consistency_ok_consecutive=args.consistency_ok_consecutive,
+                cooldown_remaining_sec=args.cooldown_remaining_sec,
+                mismatch_size_last=args.mismatch_size_last,
+                event_latency_ms_p99=args.event_latency_ms_p99,
+                queue_depth_max=args.queue_depth_max,
+                ca_gate_win_ms=cfg.strategy.ca_ratio_win_ms,
+                ca_gate_thr=cfg.strategy.ca_threshold,
+                ca_gate_total=args.ca_gate_total,
+                ca_gate_allow=args.ca_gate_allow,
+                ca_gate_block=args.ca_gate_block,
+                ca_gate_block_rate=args.ca_gate_block_rate,
+                end_pos=end_pos,
+                active_count_end=active_count_end,
+                major_alerts=major_alerts,
+                cfg_rev=cfg_rev,
+                cfg_files=cfg_files,
+                mode=args.mode_label,
+            )
+
+
+def _safe_get(root: Any, *path: str, default: Any = None) -> Any:
+    # ネストした dict / オブジェクト属性を path の順にたどって値を取得する（無ければ default）
+    cur = root
+    for key in path:
+        if cur is None:
+            return default
+        if isinstance(cur, dict):
+            cur = cur.get(key, default)
+        else:
+            cur = getattr(cur, key, default)
+    return cur
+
+
+def _first_not_none(*values: Any, default: Any = None) -> Any:
+    # 複数候補から「最初に見つかった None ではない値」を採用する（全部 None なら default）
+    for v in values:
+        if v is not None:
+            return v
+    return default
+
+
+def _emit_entry_guard(logger, env: dict[str, Any]) -> None:
+    # 入口条件（整合/クールダウン/遅延/queue/ca_gate/後始末）を1行ログで証明できる形にまとめて出す
+    cfg = env.get("cfg") or env.get("config") or env.get("settings")
+    engine = env.get("engine") or env.get("pos_engine") or env.get("app") or env.get("runner")
+    strategy = env.get("strategy") or env.get("stall_strategy")
+
+    ca_win_ms = _first_not_none(
+        _safe_get(cfg, "ca_ratio_win_ms", default=None),
+        _safe_get(strategy, "cfg", "ca_ratio_win_ms", default=None),
+        default=None,
+    )
+    ca_thr = _first_not_none(
+        _safe_get(cfg, "ca_threshold", default=None),
+        _safe_get(strategy, "cfg", "ca_threshold", default=None),
+        default=None,
+    )
+    ca_block_rate = _first_not_none(
+        _safe_get(engine, "metrics", "ca_gate_block_rate", default=None),
+        _safe_get(strategy, "ca_gate", "block_rate", default=None),
+        default=None,
+    )
+
+    consistency_ok_consecutive = _first_not_none(
+        _safe_get(engine, "health", "consistency_ok_consecutive", default=None),
+        _safe_get(engine, "consistency_ok_consecutive", default=None),
+        default=None,
+    )
+    cooldown_remaining_sec = _first_not_none(
+        _safe_get(engine, "health", "cooldown_remaining_sec", default=None),
+        _safe_get(engine, "cooldown_remaining_sec", default=None),
+        default=None,
+    )
+    event_latency_ms_p99 = _first_not_none(
+        _safe_get(engine, "metrics", "event_latency_ms_p99", default=None),
+        _safe_get(engine, "event_latency_ms_p99", default=None),
+        default=None,
+    )
+    queue_depth_max = _first_not_none(
+        _safe_get(engine, "metrics", "queue_depth_max", default=None),
+        _safe_get(engine, "queue_depth_max", default=None),
+        default=None,
+    )
+    active_count = _first_not_none(
+        env.get("active_count"),
+        env.get("active_after"),
+        _safe_get(engine, "active_count", default=None),
+        default=None,
+    )
+    errors = _first_not_none(
+        env.get("error_count"),
+        env.get("errors"),
+        default=0,
+    )
+
+    logger.info(
+        "ENTRY_GUARD consistency_ok_consecutive={} cooldown_remaining_sec={} event_latency_ms_p99={} queue_depth_max={} ca_gate_win_ms={} ca_gate_thr={} ca_gate_block_rate={} active_count={} errors={}",
+        consistency_ok_consecutive,
+        cooldown_remaining_sec,
+        event_latency_ms_p99,
+        queue_depth_max,
+        ca_win_ms,
+        ca_thr,
+        ca_block_rate,
+        active_count,
+        errors,
+    )
 
 
 def main() -> None:
@@ -517,6 +772,19 @@ def main() -> None:
     parser.add_argument("--order-hold-sec", type=float, default=2.0)
     parser.add_argument("--order-interval-sec", type=int, default=60)
     parser.add_argument("--order-ws-timeout-sec", type=int, default=20)
+    parser.add_argument("--post-cancel-poll-sec", type=float, default=10.0)
+    parser.add_argument("--post-cancel-poll-interval-sec", type=float, default=1.0)
+    parser.add_argument("--mode-label", default="canary")
+    parser.add_argument("--consistency-ok-consecutive", type=int)
+    parser.add_argument("--cooldown-remaining-sec", type=float)
+    parser.add_argument("--mismatch-size-last", type=float)
+    parser.add_argument("--event-latency-ms-p99", type=float)
+    parser.add_argument("--queue-depth-max", type=int)
+    parser.add_argument("--ca-gate-total", type=int)
+    parser.add_argument("--ca-gate-allow", type=int)
+    parser.add_argument("--ca-gate-block", type=int)
+    parser.add_argument("--ca-gate-block-rate", type=float)
+    parser.add_argument("--cfg-rev", default="")
 
     args = parser.parse_args()
     try:
