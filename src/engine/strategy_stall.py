@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 import os  # 【ABガード】環境変数で「期待するca_threshold」を受け取るため
 import time  # 何をするimportか：C/A比の窓（ms）を動かすために現在時刻msを作る
-from typing import Optional
+from typing import Optional, Any
 
 from loguru import logger
 
@@ -46,9 +46,11 @@ class StallThenStrikeStrategy:
         tick_size: Decimal,
         inventory: InventoryManager,
         tag: str = "stall",
+        metrics: Optional[Any] = None,
     ) -> None:
         self.cfg = cfg
         self._ca = CancelAddRatio(win_ms=self.cfg.ca_ratio_win_ms)  # 何をするコードか：直近win_msのBest層C/A比を計算する状態を初期化する
+        self._metrics = metrics
         expected_thr = os.getenv("AB_EXPECT_CA_THRESHOLD")  # 【ABガード】このランで期待するca_threshold（例: "1.3" / "999"）を外から渡す
         actual_thr = float(self.cfg.ca_threshold)  # 【ABガード】実際に読み込まれたca_threshold（ログと判定の唯一の真実）
         actual_win_ms = int(self.cfg.ca_ratio_win_ms)  # 【ABガード】実際に読み込まれた窓（ms）
@@ -175,6 +177,8 @@ class StallThenStrikeStrategy:
                 self._ca_gate_allow += 1
             else:
                 self._ca_gate_block += 1
+            if self._metrics is not None and hasattr(self._metrics, "record_ca_gate"):
+                self._metrics.record_ca_gate(state, now_mono=time.monotonic())
             print(  # 何をするコードか：C/Aゲートの“今”を実行ログに出して、効いているか確認できるようにする
                 f"ca_gate state={state} win_ms={self.cfg.ca_ratio_win_ms} "
                 f"thr={self.cfg.ca_threshold} add={add_sum} cancel={cancel_sum} ratio={ratio}"

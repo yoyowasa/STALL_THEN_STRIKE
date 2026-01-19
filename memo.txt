@@ -2,3 +2,12 @@
 .\.venv\Scripts\python -m src.app.run_smoke --override configs/live.yml --simulate-orders --simulate-fills --sim-side-mode alternate --order-distance-jpy 2000 --order-interval-sec 10 --order-hold-sec 1 --poll-collateral-sec 30 --duration-sec 300
 
 .\.venv\Scripts\python -m src.app.run_paper --duration-sec 60 --fill-mode one --fill-delay-sec 0.1
+
+# ステージ：作業ツリーの全変更（追加・更新・削除）を一括
+git add -A
+
+# コミット
+git commit -m "chore: bulk update after lint & format"
+
+# プッシュ
+git push

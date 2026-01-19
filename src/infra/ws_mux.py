@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Literal, Optional
@@ -15,6 +16,8 @@ class WsEvent:
     ts: datetime
     operation: str
     data: dict[str, Any]
+    recv_mono: float = 0.0
+    queue_depth: int = 0
 
 
 class WsMux:
@@ -100,10 +103,13 @@ class WsMux:
                     pc = data.get("product_code")
                     if pc and pc != self.product_code:
                         continue
+                now_mono = time.monotonic()
                 evt = WsEvent(
                     kind=kind,
                     ts=datetime.now(tz=timezone.utc),
                     operation=change.operation,
                     data=dict(change.data),
+                    recv_mono=now_mono,
+                    queue_depth=self._queue.qsize() + 1,
                 )
                 await self._queue.put(evt)

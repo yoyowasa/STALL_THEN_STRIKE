@@ -586,32 +586,28 @@ async def main_async(args: argparse.Namespace) -> None:
                         f"realized={st.realized_pnl_jpy} unrealized={st.unrealized_pnl_jpy} total={st.total_pnl_jpy}"
                     )
                     env = dict(locals())
-                    # ENTRY_GUARD が参照するキーに「実体」を必ず入れて、None 判定を防ぐ
                     env["cfg"] = cfg.strategy
-                    ca_gate_block_rate = args.ca_gate_block_rate
-                    if (
-                        ca_gate_block_rate is None
-                        and args.ca_gate_total
-                        and args.ca_gate_block is not None
-                    ):
-                        ca_gate_block_rate = args.ca_gate_block / args.ca_gate_total
-                    env["engine"] = {
-                        "health": {
-                            "consistency_ok_consecutive": args.consistency_ok_consecutive,
-                            "cooldown_remaining_sec": args.cooldown_remaining_sec,
-                        },
-                        "metrics": {
-                            "event_latency_ms_p99": args.event_latency_ms_p99,
-                            "queue_depth_max": args.queue_depth_max,
-                            "ca_gate_block_rate": ca_gate_block_rate,
-                        },
-                    }
-                    env["strategy"] = {"cfg": cfg.strategy}
+                    active_count: Any = None
+                    try:
+                        active_now = await http.get_child_orders(child_order_state="ACTIVE", count=50)
+                        if isinstance(active_now, list):
+                            active_count = len(active_now)
+                        else:
+                            logger.info(f"ACTIVE summary response: {active_now}")
+                    except Exception as e:
+                        warn(f"ACTIVE summary error: {e}")
+
                     active_after = env.get("active_after")
                     if isinstance(active_after, list):
                         env["active_after"] = len(active_after)
                     else:
                         env["active_after"] = active_after
+                    if active_count is None:
+                        active_count = env.get("active_after")
+                    env["active_count"] = active_count
+
+                    error_count = major_alerts
+                    env["error_count"] = error_count
                     env["errors"] = major_alerts
                     _emit_entry_guard(logger, env)
 
@@ -631,17 +627,17 @@ async def main_async(args: argparse.Namespace) -> None:
             except Exception as e:
                 warn(f"ACTIVE final error: {e}")
             rollout_entry_gate_summary(
-                consistency_ok_consecutive=args.consistency_ok_consecutive,
-                cooldown_remaining_sec=args.cooldown_remaining_sec,
-                mismatch_size_last=args.mismatch_size_last,
-                event_latency_ms_p99=args.event_latency_ms_p99,
-                queue_depth_max=args.queue_depth_max,
+                consistency_ok_consecutive=None,
+                cooldown_remaining_sec=None,
+                mismatch_size_last=None,
+                event_latency_ms_p99=None,
+                queue_depth_max=None,
                 ca_gate_win_ms=cfg.strategy.ca_ratio_win_ms,
                 ca_gate_thr=cfg.strategy.ca_threshold,
-                ca_gate_total=args.ca_gate_total,
-                ca_gate_allow=args.ca_gate_allow,
-                ca_gate_block=args.ca_gate_block,
-                ca_gate_block_rate=args.ca_gate_block_rate,
+                ca_gate_total=None,
+                ca_gate_allow=None,
+                ca_gate_block=None,
+                ca_gate_block_rate=None,
                 end_pos=end_pos,
                 active_count_end=active_count_end,
                 major_alerts=major_alerts,
@@ -651,17 +647,41 @@ async def main_async(args: argparse.Namespace) -> None:
             )
 
 
-def _safe_get(root: Any, *path: str, default: Any = None) -> Any:
-    # ネストした dict / オブジェクト属性を path の順にたどって値を取得する（無ければ default）
-    cur = root
+def _safe_get(obj: Any, *path: str, default: Any = None) -> Any:
+    # 何をする: dictキー / オブジェクト属性 を混在していても、path順に安全に辿って値を返す（途中で欠けたらdefault）
+    cur = obj
+
     for key in path:
+        # 何をする: 途中で None になったらそれ以上辿れないので default で打ち切る
         if cur is None:
             return default
+
+        # 何をする: dict の場合はキーで辿る
         if isinstance(cur, dict):
-            cur = cur.get(key, default)
-        else:
-            cur = getattr(cur, key, default)
-    return cur
+            if key in cur:
+                cur = cur[key]
+                continue
+            return default
+
+        # 何をする: dict以外は属性として辿る
+        if hasattr(cur, key):
+            cur = getattr(cur, key)
+            continue
+
+        return default
+
+    # 何をする: 最終結果が None のときだけ default にする（0 や False はそのまま返す）
+    return default if cur is None else cur
+
+
+def _safe_call(maybe_fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+    # callable なら実行し、例外が出ても None で握りつぶして監視ログ出力を止めない
+    if not callable(maybe_fn):
+        return None
+    try:
+        return maybe_fn(*args, **kwargs)
+    except Exception:
+        return None
 
 
 def _first_not_none(*values: Any, default: Any = None) -> Any:
@@ -672,11 +692,71 @@ def _first_not_none(*values: Any, default: Any = None) -> Any:
     return default
 
 
+def _safe_obj_keys(obj: Any, *, limit: int = 30) -> str:  # デバッグ用に「中身のキー/属性」を安全に見える化する
+    if obj is None:  # Noneならそのまま返す
+        return "None"  # Noneを明示する
+    try:  # 例外が出ても落とさない
+        if isinstance(obj, dict):  # dictならkeys()を見る
+            keys = sorted(str(k) for k in obj.keys())  # キー名を昇順にする
+        else:  # 通常オブジェクトなら __dict__ を見る
+            try:
+                keys = sorted(vars(obj).keys())  # 属性名を昇順にする
+            except Exception:
+                keys = sorted(k for k in dir(obj) if not k.startswith("_"))
+        if len(keys) > limit:  # 長すぎるとログが壊れるので制限する
+            keys = keys[:limit] + ["..."]  # 省略記号を付ける
+        return f"{type(obj).__name__} keys={keys}"  # 型名とキー一覧を返す
+    except Exception:  # どんな例外でも握りつぶす（デバッグで落ちるのが一番危険）
+        return type(obj).__name__  # 最低限、型名だけ返す
+
+
 def _emit_entry_guard(logger, env: dict[str, Any]) -> None:
     # 入口条件（整合/クールダウン/遅延/queue/ca_gate/後始末）を1行ログで証明できる形にまとめて出す
     cfg = env.get("cfg") or env.get("config") or env.get("settings")
-    engine = env.get("engine") or env.get("pos_engine") or env.get("app") or env.get("runner")
-    strategy = env.get("strategy") or env.get("stall_strategy")
+
+    # ENTRY_GUARD: args由来のスタブ(dict)を避け、実体のengine/runnerを優先して拾う
+    engine = None
+    for cand in (env.get("pos_engine"), env.get("app"), env.get("runner"), env.get("engine")):
+        if cand is None:
+            continue
+        if isinstance(cand, dict) and set(cand.keys()) <= {"health", "metrics"}:
+            health = cand.get("health") or {}
+            metrics = cand.get("metrics") or {}
+            # すべてNoneなら「スタブ」とみなしてスキップ（実値が入っている場合は採用）
+            if all(v is None for v in health.values()) and all(v is None for v in metrics.values()):
+                continue
+        engine = cand
+        break
+
+    # ENTRY_GUARD: {"cfg": StallStrategyConfig} みたいなスタブdictを避け、実体strategyを優先して拾う
+    strategy = None
+    for cand in (
+        env.get("stall_strategy"),
+        env.get("strategy"),
+        _safe_get(engine, "strategy", default=None),
+        _safe_get(engine, "stall_strategy", default=None),
+    ):
+        if cand is None:
+            continue
+        if isinstance(cand, dict) and set(cand.keys()) <= {"cfg"}:
+            continue
+        strategy = cand
+        break
+
+    engine_health = _first_not_none(
+        # engine が health をメソッド提供している場合に拾う（例: get_health/health_snapshot）
+        _safe_call(_safe_get(engine, "get_health", default=None)),
+        _safe_call(_safe_get(engine, "health_snapshot", default=None)),
+        _safe_get(engine, "health", default=None),
+        default=None,
+    )
+    engine_metrics = _first_not_none(
+        # engine が metrics をメソッド提供している場合に拾う（例: get_metrics/metrics_snapshot）
+        _safe_call(_safe_get(engine, "get_metrics", default=None)),
+        _safe_call(_safe_get(engine, "metrics_snapshot", default=None)),
+        _safe_get(engine, "metrics", default=None),
+        default=None,
+    )
 
     ca_win_ms = _first_not_none(
         _safe_get(cfg, "ca_ratio_win_ms", default=None),
@@ -686,11 +766,6 @@ def _emit_entry_guard(logger, env: dict[str, Any]) -> None:
     ca_thr = _first_not_none(
         _safe_get(cfg, "ca_threshold", default=None),
         _safe_get(strategy, "cfg", "ca_threshold", default=None),
-        default=None,
-    )
-    ca_block_rate = _first_not_none(
-        _safe_get(engine, "metrics", "ca_gate_block_rate", default=None),
-        _safe_get(strategy, "ca_gate", "block_rate", default=None),
         default=None,
     )
 
@@ -714,6 +789,11 @@ def _emit_entry_guard(logger, env: dict[str, Any]) -> None:
         _safe_get(engine, "queue_depth_max", default=None),
         default=None,
     )
+    ca_block_rate = _first_not_none(
+        _safe_get(engine, "metrics", "ca_gate_block_rate", default=None),
+        _safe_get(strategy, "ca_gate", "block_rate", default=None),
+        default=None,
+    )
     active_count = _first_not_none(
         env.get("active_count"),
         env.get("active_after"),
@@ -725,6 +805,23 @@ def _emit_entry_guard(logger, env: dict[str, Any]) -> None:
         env.get("errors"),
         default=0,
     )
+
+    if (
+        consistency_ok_consecutive is None
+        or cooldown_remaining_sec is None
+        or event_latency_ms_p99 is None
+        or queue_depth_max is None
+        or ca_block_rate is None
+    ):
+        logger.info(
+            "ENTRY_GUARD_SRC engine={} engine_health={} engine_metrics={} strategy={} strategy_cfg={} strategy_ca_gate={}",
+            _safe_obj_keys(engine),
+            _safe_obj_keys(engine_health),
+            _safe_obj_keys(engine_metrics),
+            _safe_obj_keys(strategy),
+            _safe_obj_keys(_safe_get(strategy, "cfg", default=None)),
+            _safe_obj_keys(_safe_get(strategy, "ca_gate", default=None)),
+        )
 
     logger.info(
         "ENTRY_GUARD consistency_ok_consecutive={} cooldown_remaining_sec={} event_latency_ms_p99={} queue_depth_max={} ca_gate_win_ms={} ca_gate_thr={} ca_gate_block_rate={} active_count={} errors={}",
@@ -775,15 +872,6 @@ def main() -> None:
     parser.add_argument("--post-cancel-poll-sec", type=float, default=10.0)
     parser.add_argument("--post-cancel-poll-interval-sec", type=float, default=1.0)
     parser.add_argument("--mode-label", default="canary")
-    parser.add_argument("--consistency-ok-consecutive", type=int)
-    parser.add_argument("--cooldown-remaining-sec", type=float)
-    parser.add_argument("--mismatch-size-last", type=float)
-    parser.add_argument("--event-latency-ms-p99", type=float)
-    parser.add_argument("--queue-depth-max", type=int)
-    parser.add_argument("--ca-gate-total", type=int)
-    parser.add_argument("--ca-gate-allow", type=int)
-    parser.add_argument("--ca-gate-block", type=int)
-    parser.add_argument("--ca-gate-block-rate", type=float)
     parser.add_argument("--cfg-rev", default="")
 
     args = parser.parse_args()
