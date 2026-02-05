@@ -11,3 +11,6 @@ git commit -m "chore: bulk update after lint & format"
 
 # プッシュ
 git push
+
+cd "C:\BOT\stall_then_strike"
+.\.venv\Scripts\Activate.ps1
