@@ -49,6 +49,25 @@ class BitflyerHttp:
         resp = await self.client.post("/v1/me/sendchildorder", data=payload)
         return await resp.json(content_type=None)
 
+    async def send_market_order(
+        self,
+        *,
+        side: str,
+        size: float,
+        product_code: Optional[str] = None,
+        tag: Optional[str] = None,
+    ) -> Any:
+        payload: dict[str, Any] = {
+            "product_code": product_code or self.exchange_cfg.product_code,
+            "child_order_type": "MARKET",
+            "side": side,
+            "size": size,
+        }
+        if tag:
+            payload["identifier"] = tag
+        resp = await self.client.post("/v1/me/sendchildorder", data=payload)
+        return await resp.json(content_type=None)
+
     async def cancel_order(
         self,
         child_order_acceptance_id: str,
