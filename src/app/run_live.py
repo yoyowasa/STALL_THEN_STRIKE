@@ -559,7 +559,7 @@ async def _run_trade(
             avg_pos,
         )
         logger.info(
-            "ENTRY_GUARD_ERRORS_WINDOW window_sec={} require_errors=={}",
+            "ENTRY_GUARD_ERRORS_WINDOW window_sec={} require_errors<={}",
             error_window_sec,
             guard_thresholds.get("errors"),
         )

@@ -185,7 +185,7 @@ def _guard_result(
     _check("queue_depth_max", lambda a, t: a <= t)
     _check("ca_gate_block_rate", lambda a, t: a <= t)
     _check("active_count", lambda a, t: a == t)
-    _check("errors", lambda a, t: a == t)
+    _check("errors", lambda a, t: a <= t)
 
     reasons: list[str] = []
     if missing_metrics:
@@ -226,7 +226,7 @@ def _emit_guard(
         f"require_queue_depth_max<={_fmt_guard(thresholds['queue_depth_max'])} "
         f"require_ca_gate_block_rate<={_fmt_guard(thresholds['ca_gate_block_rate'])} "
         f"require_active_count=={_fmt_guard(thresholds['active_count'])} "
-        f"require_errors=={_fmt_guard(thresholds['errors'])}"
+        f"require_errors<={_fmt_guard(thresholds['errors'])}"
     )
     passed, reason = _guard_result(actual, thresholds)
     logger.info(f"{prefix}_RESULT pass={str(passed).lower()} reason=\"{reason}\"")
