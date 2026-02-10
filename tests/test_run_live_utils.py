@@ -1,0 +1,42 @@
+from decimal import Decimal
+
+from src.app.run_live import _env_bool, _positions_to_net
+
+
+def test_env_bool_true_false(monkeypatch):
+    monkeypatch.setenv("X_BOOL", "true")
+    assert _env_bool("X_BOOL", False) is True
+
+    monkeypatch.setenv("X_BOOL", "0")
+    assert _env_bool("X_BOOL", True) is False
+
+
+def test_env_bool_default(monkeypatch):
+    monkeypatch.delenv("X_BOOL", raising=False)
+    assert _env_bool("X_BOOL", True) is True
+    assert _env_bool("X_BOOL", False) is False
+
+    monkeypatch.setenv("X_BOOL", "not-bool")
+    assert _env_bool("X_BOOL", True) is True
+    assert _env_bool("X_BOOL", False) is False
+
+
+def test_positions_to_net_empty():
+    net, avg, rows = _positions_to_net([])
+    assert net == Decimal("0")
+    assert avg is None
+    assert rows == 0
+
+
+def test_positions_to_net_mixed():
+    positions = [
+        {"side": "BUY", "size": 0.2, "price": 100},
+        {"side": "SELL", "size": 0.1, "price": 120},
+        {"side": "BUY", "size": 0, "price": 999},  # 無効行
+        {"side": "X", "size": 1, "price": 1},  # 無効行
+    ]
+    net, avg, rows = _positions_to_net(positions)
+    assert net == Decimal("0.1")
+    assert avg == Decimal("80")
+    assert rows == 2
+

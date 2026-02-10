@@ -22,9 +22,10 @@ if (-not (Test-Path $pythonExe)) {
 
 $override = if ($env:RUN_LIVE_OVERRIDE) { $env:RUN_LIVE_OVERRIDE } else { "configs/live.yml" }
 $durationSec = if ($env:RUN_LIVE_DURATION_SEC) { $env:RUN_LIVE_DURATION_SEC } else { "0" }
+$confirm = if ($env:RUN_LIVE_CONFIRM) { $env:RUN_LIVE_CONFIRM } else { "I_UNDERSTAND" }
 
 $proc = Start-Process -FilePath $pythonExe `
-  -ArgumentList @("-m", "src.app.run_live", "--override", $override, "--duration-sec", $durationSec) `
+  -ArgumentList @("-m", "src.app.run_live", "--override", $override, "--duration-sec", $durationSec, "--confirm", $confirm) `
   -WorkingDirectory "C:\BOT\stall_then_strike" `
   -NoNewWindow -Wait -PassThru
 [int]$pyExit = $proc.ExitCode

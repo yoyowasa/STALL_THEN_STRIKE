@@ -36,7 +36,18 @@ def _setup_logging() -> None:
     log_dir = Path("logs") / "runtime"
     log_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d-%H%M%S")
-    logger.add(log_dir / f"live-{ts}.log", level="INFO", enqueue=True)
+    level = os.getenv("LOG_LEVEL", "INFO")
+    rotation = os.getenv("LIVE_LOG_ROTATION", "200 MB")
+    retention = os.getenv("LIVE_LOG_RETENTION", "14 days")
+    compression = os.getenv("LIVE_LOG_COMPRESSION", "zip")
+    logger.add(
+        log_dir / f"live-{ts}.log",
+        level=level,
+        enqueue=True,
+        rotation=rotation,
+        retention=retention,
+        compression=compression,
+    )
 
 
 def _live_channels(product_code: str, base_channels: list[str]) -> list[str]:
@@ -57,16 +68,18 @@ def _env_bool(name: str, default: bool) -> bool:
     return default
 
 
-async def _sync_inventory_from_exchange(
-    *,
-    http: BitflyerHttp,
-    product_code: str,
-    inventory: InventoryManager,
-    strategy: StallThenStrikeStrategy,
-) -> tuple[Decimal, Optional[Decimal], int]:
-    positions = await http.get_positions(product_code=product_code)
+def _env_int(name: str, default: int) -> int:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    try:
+        return int(val)
+    except Exception:
+        return default
+
+
+def _positions_to_net(positions: Any) -> tuple[Decimal, Optional[Decimal], int]:
     if not isinstance(positions, list):
-        logger.warning(f"get_positions unexpected response: {positions}")
         return Decimal("0"), None, 0
 
     net = Decimal("0")
@@ -89,8 +102,40 @@ async def _sync_inventory_from_exchange(
 
     if net == 0:
         return Decimal("0"), None, rows
+    avg_price = abs(signed_notional / net)
+    return net, avg_price, rows
 
-    avg_price = abs(signed_notional / net) if net != 0 else None
+
+async def _fetch_exchange_position(
+    *,
+    http: BitflyerHttp,
+    product_code: str,
+) -> tuple[Decimal, Optional[Decimal], int]:
+    try:
+        positions = await http.get_positions(product_code=product_code)
+    except Exception as exc:
+        logger.warning(f"get_positions failed: {exc}")
+        return Decimal("0"), None, 0
+    net, avg_price, rows = _positions_to_net(positions)
+    if not isinstance(positions, list):
+        logger.warning(f"get_positions unexpected response: {positions}")
+    return net, avg_price, rows
+
+
+async def _sync_inventory_from_exchange(
+    *,
+    http: BitflyerHttp,
+    product_code: str,
+    inventory: InventoryManager,
+    strategy: StallThenStrikeStrategy,
+) -> tuple[Decimal, Optional[Decimal], int]:
+    net, avg_price, rows = await _fetch_exchange_position(
+        http=http,
+        product_code=product_code,
+    )
+    if net == 0:
+        return Decimal("0"), None, rows
+
     if avg_price is None or avg_price <= 0:
         avg_price = Decimal("0")
     fill_side: Side = "BUY" if net > 0 else "SELL"
@@ -510,19 +555,58 @@ async def _run_trade(
                     error_count += 1
                     logger.exception("終了処理の cancel_all で例外が発生しました。")
 
-                pos = inventory.position_btc
-                if pos != 0:
-                    board = await ensure_close_board(now)
-                    close_side: Side = "SELL" if pos > 0 else "BUY"
-                    try:
-                        await executor.execute(
-                            [Action(kind="close_market", side=close_side, size=abs(pos), tag="shutdown")],
-                            now=now,
-                            board=board,
+                close_retry_max = max(1, _env_int("LIVE_CLOSE_MAX_RETRY", 3))
+                close_retry_wait_sec = _env_float("LIVE_CLOSE_RETRY_WAIT_SEC") or 0.7
+                close_retry_wait_sec = max(0.2, float(close_retry_wait_sec))
+                exchange_pos_before, _, _ = await _fetch_exchange_position(
+                    http=http,
+                    product_code=cfg.exchange.product_code,
+                )
+                exchange_pos_after = exchange_pos_before
+                if exchange_pos_before != 0:
+                    for attempt in range(1, close_retry_max + 1):
+                        close_side: Side = "SELL" if exchange_pos_after > 0 else "BUY"
+                        close_size = abs(exchange_pos_after)
+                        try:
+                            await executor.execute(
+                                [
+                                    Action(
+                                        kind="close_market",
+                                        side=close_side,
+                                        size=close_size,
+                                        tag="shutdown",
+                                    )
+                                ],
+                                now=now,
+                                board=await ensure_close_board(now),
+                            )
+                        except Exception:
+                            error_count += 1
+                            logger.exception(
+                                "終了処理の close_market で例外が発生しました。 "
+                                f"attempt={attempt}"
+                            )
+                        await asyncio.sleep(close_retry_wait_sec)
+                        await executor.poll(now=now, force_reconcile=True)
+                        exchange_pos_after, _, _ = await _fetch_exchange_position(
+                            http=http,
+                            product_code=cfg.exchange.product_code,
                         )
-                    except Exception:
+                        logger.info(
+                            "SHUTDOWN_CLOSE_RETRY attempt={} residual_position_btc={}",
+                            attempt,
+                            exchange_pos_after,
+                        )
+                        if exchange_pos_after == 0:
+                            break
+                    if exchange_pos_after != 0:
                         error_count += 1
-                        logger.exception("終了処理の close_market で例外が発生しました。")
+                        logger.error(
+                            "SHUTDOWN_CLOSE_FAILED residual_position_btc={}",
+                            exchange_pos_after,
+                        )
+                else:
+                    logger.info("SHUTDOWN_CLOSE_SKIP residual_position_btc=0")
                 await executor.poll(now=now, force_reconcile=True)
 
                 promote_actual = _guard_actual(
@@ -552,6 +636,8 @@ async def _run_trade(
                 logger.info(
                     "SHUTDOWN "
                     f"cancelled={cancelled} pos_before={pos0} pos_after={pos1} "
+                    f"exchange_pos_before={exchange_pos_before} "
+                    f"exchange_pos_after={exchange_pos_after} "
                     f"open_orders_before={open0} open_orders_after={strategy.open_order_count} "
                     f"active_orders_before={active0} "
                     f"active_orders_after={executor.active_order_count(tag=strategy.tag)} "
@@ -580,6 +666,7 @@ def main() -> None:
         default=0,
         help="0 以下で無期限実行（default: 0）",
     )
+    parser.add_argument("--confirm", default="")
     parser.add_argument("--eval-interval-ms", type=int, default=50)
     parser.add_argument("--summary-interval-sec", type=int, default=10)
     args = parser.parse_args()
@@ -588,6 +675,11 @@ def main() -> None:
         if args.mode == "listen":
             asyncio.run(_run_listen(args.override, args.duration_sec))
         else:
+            if _env_bool("LIVE_REQUIRE_CONFIRM", True) and args.confirm != "I_UNDERSTAND":
+                raise SystemExit(
+                    "Refusing to place live orders. Pass --confirm I_UNDERSTAND "
+                    "or set LIVE_REQUIRE_CONFIRM=false."
+                )
             asyncio.run(
                 _run_trade(
                     args.override,
