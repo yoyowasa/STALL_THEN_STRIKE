@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from collections import deque
 import json
 import os
 import socket
@@ -79,6 +80,20 @@ def _env_int(name: str, default: int) -> int:
         return int(val)
     except Exception:
         return default
+
+
+def _trim_recent_errors(
+    samples: deque[float],
+    *,
+    now_mono: float,
+    window_sec: float,
+) -> int:
+    if window_sec <= 0:
+        return len(samples)
+    cutoff = now_mono - window_sec
+    while samples and samples[0] < cutoff:
+        samples.popleft()
+    return len(samples)
 
 
 def _resolve_alert_webhook_url() -> str:
@@ -414,7 +429,36 @@ async def _run_trade(
         last_decision_type: Optional[str] = None
         last_snap: Optional[BoardSnapshot] = None
         trade_count = 0
-        error_count = 0
+        error_count_total = 0
+        error_window_sec = _env_float("ENTRY_GUARD_ERRORS_WINDOW_SEC")
+        if error_window_sec is None:
+            error_window_sec = 300.0
+        error_window_sec = max(0.0, float(error_window_sec))
+        error_recent_mono: deque[float] = deque()
+
+        def _guard_error_count(now_mono: float) -> int:
+            if error_window_sec <= 0:
+                return error_count_total
+            return _trim_recent_errors(
+                error_recent_mono,
+                now_mono=now_mono,
+                window_sec=error_window_sec,
+            )
+
+        def _record_error(context: str) -> None:
+            nonlocal error_count_total
+            error_count_total += 1
+            now_mono = time.monotonic()
+            if error_window_sec > 0:
+                error_recent_mono.append(now_mono)
+            guard_errors = _guard_error_count(now_mono)
+            logger.warning(
+                "GUARD_ERROR context={} total_errors={} guard_errors={} window_sec={}",
+                context,
+                error_count_total,
+                guard_errors,
+                error_window_sec,
+            )
 
         def _evt_ts(data: dict[str, Any]) -> datetime:
             v = data.get("event_date")
@@ -500,12 +544,17 @@ async def _run_trade(
             net_pos,
             avg_pos,
         )
+        logger.info(
+            "ENTRY_GUARD_ERRORS_WINDOW window_sec={} require_errors=={}",
+            error_window_sec,
+            guard_thresholds.get("errors"),
+        )
 
         entry_actual = _guard_actual(
             engine=engine,
             strategy=strategy,
             executor=executor,
-            error_count=error_count,
+            error_count=_guard_error_count(time.monotonic()),
         )
         _emit_guard(
             "ENTRY_GUARD",
@@ -535,7 +584,6 @@ async def _run_trade(
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
 
         async def _consume_ws_events(mux: WsMux) -> None:
-            nonlocal error_count
             while True:
                 try:
                     evt = await mux.get(timeout=1)
@@ -554,7 +602,7 @@ async def _run_trade(
                     executor.on_child_event(enriched)
                     handle_child_event(enriched)
                 except Exception:
-                    error_count += 1
+                    _record_error("child_order_events")
                     logger.exception("child_order_events 処理で例外が発生しました。")
 
         async def ensure_close_board(now: datetime) -> BoardSnapshot:
@@ -605,7 +653,7 @@ async def _run_trade(
                                 engine=engine,
                                 strategy=strategy,
                                 executor=executor,
-                                error_count=error_count,
+                                error_count=_guard_error_count(now_mono),
                             )
                             guard_pass, guard_reason = _guard_result(
                                 guard_actual,
@@ -637,7 +685,7 @@ async def _run_trade(
                         try:
                             await executor.execute(actions, now=now, board=snap)
                         except Exception:
-                            error_count += 1
+                            _record_error("execute_actions")
                             logger.exception("注文実行で例外が発生しました。")
 
                         await executor.poll(now=now)
@@ -687,7 +735,7 @@ async def _run_trade(
                         now=now,
                     )
                 except Exception:
-                    error_count += 1
+                    _record_error("shutdown_cancel_all")
                     logger.exception("終了処理の cancel_all で例外が発生しました。")
 
                 close_retry_max = max(1, _env_int("LIVE_CLOSE_MAX_RETRY", 3))
@@ -716,7 +764,7 @@ async def _run_trade(
                                 board=await ensure_close_board(now),
                             )
                         except Exception:
-                            error_count += 1
+                            _record_error("shutdown_close_market")
                             logger.exception(
                                 "終了処理の close_market で例外が発生しました。 "
                                 f"attempt={attempt}"
@@ -735,7 +783,7 @@ async def _run_trade(
                         if exchange_pos_after == 0:
                             break
                     if exchange_pos_after != 0:
-                        error_count += 1
+                        _record_error("shutdown_close_failed")
                         logger.error(
                             "SHUTDOWN_CLOSE_FAILED residual_position_btc={}",
                             exchange_pos_after,
@@ -759,7 +807,7 @@ async def _run_trade(
                     engine=engine,
                     strategy=strategy,
                     executor=executor,
-                    error_count=error_count,
+                    error_count=_guard_error_count(time.monotonic()),
                 )
                 _emit_guard(
                     "PROMOTE_GUARD",
@@ -787,7 +835,9 @@ async def _run_trade(
                     f"open_orders_before={open0} open_orders_after={strategy.open_order_count} "
                     f"active_orders_before={active0} "
                     f"active_orders_after={executor.active_order_count(tag=strategy.tag)} "
-                    f"pnl_before={pnl0} pnl_after={pnl1}"
+                    f"pnl_before={pnl0} pnl_after={pnl1} "
+                    f"errors_total={error_count_total} "
+                    f"guard_errors={_guard_error_count(time.monotonic())}"
                 )
                 ca_total, ca_allow, ca_block = strategy.ca_gate_stats
                 block_rate = (ca_block / ca_total) if ca_total else None

@@ -1,6 +1,12 @@
+from collections import deque
 from decimal import Decimal
 
-from src.app.run_live import _env_bool, _positions_to_net, _resolve_alert_webhook_url
+from src.app.run_live import (
+    _env_bool,
+    _positions_to_net,
+    _resolve_alert_webhook_url,
+    _trim_recent_errors,
+)
 
 
 def test_env_bool_true_false(monkeypatch):
@@ -67,3 +73,17 @@ def test_resolve_alert_webhook_url_precedence(monkeypatch):
 
     monkeypatch.setenv("LIVE_ALERT_WEBHOOK_URL", "https://example.test/live")
     assert _resolve_alert_webhook_url() == "https://example.test/live"
+
+
+def test_trim_recent_errors_windowed():
+    samples = deque([1.0, 5.0, 7.5, 12.0])
+    count = _trim_recent_errors(samples, now_mono=12.0, window_sec=5.0)
+    assert count == 2
+    assert list(samples) == [7.5, 12.0]
+
+
+def test_trim_recent_errors_no_window():
+    samples = deque([1.0, 2.0, 3.0])
+    count = _trim_recent_errors(samples, now_mono=100.0, window_sec=0.0)
+    assert count == 3
+    assert list(samples) == [1.0, 2.0, 3.0]

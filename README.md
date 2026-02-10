@@ -24,6 +24,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - `run_live_drycheck.ps1` は短時間実行で `PROMOTE_GUARD pass=false`（期待値）を確認する。安全側のため起動時 `LIVE_CANCEL_ACTIVE_ON_START=false` を設定してから実行する。
 - 異常時通知は `LIVE_ALERT_WEBHOOK_URL`（または `ALERT_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` / `SLACK_WEBHOOK_URL`）を設定すると有効。`SHUTDOWN_CLOSE_FAILED` / `RUN_LIVE_FATAL` などで Webhook 通知する。`LIVE_ALERT_ENABLED=false` で無効化可能。
 - `run_live_guard_ok.ps1` では `RUN_LIVE_ALERT_WEBHOOK_URL` を設定すると `LIVE_ALERT_WEBHOOK_URL` として引き渡せる。
+- `errors` ガードは直近ウィンドウ件数で判定（既定: `ENTRY_GUARD_ERRORS_WINDOW_SEC=300` 秒）。`ENTRY_GUARD_REQUIRE_ERRORS=0` のままでも、5分間エラーが無ければ自動でガード解除される。従来の累積判定に戻す場合は `ENTRY_GUARD_ERRORS_WINDOW_SEC=0`。
 
 ## ディレクトリ
 - `configs/` … YAML 設定
