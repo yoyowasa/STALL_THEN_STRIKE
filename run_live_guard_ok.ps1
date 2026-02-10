@@ -9,6 +9,20 @@ if (-not $env:ENTRY_GUARD_REQUIRE_CA_GATE_BLOCK_RATE) { $env:ENTRY_GUARD_REQUIRE
 if (-not $env:ENTRY_GUARD_REQUIRE_ACTIVE_COUNT) { $env:ENTRY_GUARD_REQUIRE_ACTIVE_COUNT = "0" }
 if (-not $env:ENTRY_GUARD_REQUIRE_ERRORS) { $env:ENTRY_GUARD_REQUIRE_ERRORS = "0" }
 
+# Prevent duplicate live trader processes unless explicitly allowed.
+$allowMulti = ($env:RUN_LIVE_ALLOW_MULTI -as [string])
+if ($allowMulti -notin @("1", "true", "TRUE", "yes", "YES")) {
+  $existing = Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+    Where-Object {
+      ($_.CommandLine -match "C:\\BOT\\stall_then_strike") -and
+      ($_.CommandLine -match "src\.app\.run_live")
+    }
+  if ($existing -and $existing.Count -gt 0) {
+    "ALREADY_RUNNING count=$($existing.Count)"
+    exit 6
+  }
+}
+
 # Record run start time and only accept logs created by this run.
 $logsRoot = "C:\BOT\stall_then_strike\logs"
 $start = Get-Date

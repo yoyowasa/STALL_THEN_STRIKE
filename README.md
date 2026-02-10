@@ -16,7 +16,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - `run_live` の `mode=trade` は確認トークン必須（既定）。`--confirm I_UNDERSTAND` を付与するか、`LIVE_REQUIRE_CONFIRM=false` を設定。
 - 起動時に `ACTIVE` 注文を回収してキャンセルする（既定）。無効化する場合は `LIVE_CANCEL_ACTIVE_ON_START=false` を設定。
 - 終了時の成行クローズは再試行する（既定3回）。`LIVE_CLOSE_MAX_RETRY` / `LIVE_CLOSE_RETRY_WAIT_SEC` で調整可能。
-- `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` / `RUN_LIVE_CONFIRM` で起動引数を上書き可能（`RUN_LIVE_CONFIRM` 未指定時は `I_UNDERSTAND` を既定使用）。
+- `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` / `RUN_LIVE_CONFIRM` で起動引数を上書き可能（`RUN_LIVE_CONFIRM` 未指定時は `I_UNDERSTAND` を既定使用）。既定で二重起動防止を行い、必要な場合のみ `RUN_LIVE_ALLOW_MULTI=true` で無効化。
 - liveログはローテーション/保持を有効化（既定: `LIVE_LOG_ROTATION=200 MB`, `LIVE_LOG_RETENTION=14 days`, `LIVE_LOG_COMPRESSION=zip`）。
 
 ## ディレクトリ
