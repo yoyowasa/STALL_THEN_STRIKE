@@ -3,6 +3,7 @@ from decimal import Decimal
 
 from src.app.run_live import (
     _env_bool,
+    _is_self_trade_error,
     _positions_to_net,
     _resolve_alert_webhook_url,
     _trim_recent_errors,
@@ -87,3 +88,16 @@ def test_trim_recent_errors_no_window():
     count = _trim_recent_errors(samples, now_mono=100.0, window_sec=0.0)
     assert count == 3
     assert list(samples) == [1.0, 2.0, 3.0]
+
+
+def test_is_self_trade_error_true():
+    exc = RuntimeError(
+        "send_market_order response missing id: {'status': -159, 'error_message': "
+        "'You cannot place an order as it is the Self Trade.', 'data': None}"
+    )
+    assert _is_self_trade_error(exc) is True
+
+
+def test_is_self_trade_error_false():
+    exc = RuntimeError("send_market_order response missing id: {'status': -1}")
+    assert _is_self_trade_error(exc) is False

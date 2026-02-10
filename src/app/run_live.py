@@ -96,6 +96,20 @@ def _trim_recent_errors(
     return len(samples)
 
 
+def _is_self_trade_error(exc: BaseException) -> bool:
+    cur: BaseException | None = exc
+    visited: set[int] = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        msg = str(cur).lower()
+        if "self trade" in msg:
+            return True
+        if "-159" in msg and "status" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _resolve_alert_webhook_url() -> str:
     for key in (
         "LIVE_ALERT_WEBHOOK_URL",
@@ -708,8 +722,15 @@ async def _run_trade(
 
                         try:
                             await executor.execute(actions, now=now, board=snap)
-                        except Exception:
-                            _record_error("execute_actions")
+                        except Exception as exc:
+                            if _is_self_trade_error(exc):
+                                logger.warning(
+                                    "execute_actions self-trade detected; skip guard error increment "
+                                    "err={}",
+                                    exc,
+                                )
+                            else:
+                                _record_error("execute_actions")
                             logger.exception("注文実行で例外が発生しました。")
 
                         await executor.poll(now=now)
