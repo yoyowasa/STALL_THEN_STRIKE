@@ -118,10 +118,18 @@ def _build_alert_text(
 
 
 def _post_webhook_json(url: str, payload: dict[str, Any], *, timeout_sec: float) -> None:
+    user_agent = os.getenv(
+        "LIVE_ALERT_USER_AGENT",
+        "stall-then-strike/1.0 (+https://github.com/yoyowasa/STALL_THEN_STRIKE)",
+    )
     req = urllib.request.Request(
         url=url,
         data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "Accept": "application/json, text/plain, */*",
+            "User-Agent": user_agent,
+        },
         method="POST",
     )
     with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
