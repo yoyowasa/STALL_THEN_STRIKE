@@ -10,6 +10,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - リアル口座: `python -m src.app.run_live --override configs/live.yml --duration-sec 0`
 - ペーパー運用ラッパ: `powershell -File .\\run_paper_guard_ok.ps1`
 - リアル運用ラッパ: `powershell -File .\\run_live_guard_ok.ps1`
+- 実運用前ドライチェック（1コマンド）: `powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_live_drycheck.ps1`
 
 ### 補足（live）
 - `run_live` は `--duration-sec 0`（既定値）で無期限実行。
@@ -18,6 +19,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - 終了時の成行クローズは再試行する（既定3回）。`LIVE_CLOSE_MAX_RETRY` / `LIVE_CLOSE_RETRY_WAIT_SEC` で調整可能。
 - `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` / `RUN_LIVE_CONFIRM` で起動引数を上書き可能（`RUN_LIVE_CONFIRM` 未指定時は `I_UNDERSTAND` を既定使用）。既定で二重起動防止を行い、必要な場合のみ `RUN_LIVE_ALLOW_MULTI=true` で無効化。
 - liveログはローテーション/保持を有効化（既定: `LIVE_LOG_ROTATION=200 MB`, `LIVE_LOG_RETENTION=14 days`, `LIVE_LOG_COMPRESSION=zip`）。
+- `run_live_drycheck.ps1` は短時間実行で `PROMOTE_GUARD pass=false`（期待値）を確認する。安全側のため起動時 `LIVE_CANCEL_ACTIVE_ON_START=false` を設定してから実行する。
 
 ## ディレクトリ
 - `configs/` … YAML 設定
