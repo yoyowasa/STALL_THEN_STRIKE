@@ -8,6 +8,7 @@ if (-not $env:ENTRY_GUARD_REQUIRE_QUEUE_DEPTH_MAX) { $env:ENTRY_GUARD_REQUIRE_QU
 if (-not $env:ENTRY_GUARD_REQUIRE_CA_GATE_BLOCK_RATE) { $env:ENTRY_GUARD_REQUIRE_CA_GATE_BLOCK_RATE = "0.8" }
 if (-not $env:ENTRY_GUARD_REQUIRE_ACTIVE_COUNT) { $env:ENTRY_GUARD_REQUIRE_ACTIVE_COUNT = "0" }
 if (-not $env:ENTRY_GUARD_REQUIRE_ERRORS) { $env:ENTRY_GUARD_REQUIRE_ERRORS = "0" }
+if (-not $env:LIVE_ALERT_WEBHOOK_URL -and $env:RUN_LIVE_ALERT_WEBHOOK_URL) { $env:LIVE_ALERT_WEBHOOK_URL = $env:RUN_LIVE_ALERT_WEBHOOK_URL }
 
 # Prevent duplicate live trader processes unless explicitly allowed.
 $allowMulti = ($env:RUN_LIVE_ALLOW_MULTI -as [string])

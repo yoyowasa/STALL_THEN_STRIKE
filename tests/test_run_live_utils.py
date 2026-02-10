@@ -1,6 +1,6 @@
 from decimal import Decimal
 
-from src.app.run_live import _env_bool, _positions_to_net
+from src.app.run_live import _env_bool, _positions_to_net, _resolve_alert_webhook_url
 
 
 def test_env_bool_true_false(monkeypatch):
@@ -40,3 +40,30 @@ def test_positions_to_net_mixed():
     assert avg == Decimal("80")
     assert rows == 2
 
+
+def test_resolve_alert_webhook_url_precedence(monkeypatch):
+    keys = [
+        "LIVE_ALERT_WEBHOOK_URL",
+        "ALERT_WEBHOOK_URL",
+        "DISCORD_WEBHOOK_URL",
+        "SLACK_WEBHOOK_URL",
+        "WEBHOOK_URL",
+    ]
+    for key in keys:
+        monkeypatch.delenv(key, raising=False)
+    assert _resolve_alert_webhook_url() == ""
+
+    monkeypatch.setenv("WEBHOOK_URL", "https://example.test/webhook")
+    assert _resolve_alert_webhook_url() == "https://example.test/webhook"
+
+    monkeypatch.setenv("SLACK_WEBHOOK_URL", "https://example.test/slack")
+    assert _resolve_alert_webhook_url() == "https://example.test/slack"
+
+    monkeypatch.setenv("DISCORD_WEBHOOK_URL", "https://example.test/discord")
+    assert _resolve_alert_webhook_url() == "https://example.test/discord"
+
+    monkeypatch.setenv("ALERT_WEBHOOK_URL", "https://example.test/alert")
+    assert _resolve_alert_webhook_url() == "https://example.test/alert"
+
+    monkeypatch.setenv("LIVE_ALERT_WEBHOOK_URL", "https://example.test/live")
+    assert _resolve_alert_webhook_url() == "https://example.test/live"

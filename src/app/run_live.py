@@ -1,7 +1,10 @@
 import argparse
 import asyncio
+import json
 import os
+import socket
 import time
+import urllib.request
 from datetime import datetime, timezone
 from decimal import Decimal
 from pathlib import Path
@@ -76,6 +79,118 @@ def _env_int(name: str, default: int) -> int:
         return int(val)
     except Exception:
         return default
+
+
+def _resolve_alert_webhook_url() -> str:
+    for key in (
+        "LIVE_ALERT_WEBHOOK_URL",
+        "ALERT_WEBHOOK_URL",
+        "DISCORD_WEBHOOK_URL",
+        "SLACK_WEBHOOK_URL",
+        "WEBHOOK_URL",
+    ):
+        v = os.getenv(key)
+        if v and v.strip():
+            return v.strip()
+    return ""
+
+
+def _build_alert_text(
+    *,
+    event: str,
+    level: str,
+    detail: str = "",
+    cfg_path: str | None = None,
+    product_code: str | None = None,
+) -> str:
+    lines = [
+        f"[stall_then_strike/live][{level}] {event}",
+        f"time_utc={datetime.now(tz=timezone.utc).isoformat()}",
+        f"host={socket.gethostname()} pid={os.getpid()}",
+    ]
+    if cfg_path:
+        lines.append(f"override={cfg_path}")
+    if product_code:
+        lines.append(f"product_code={product_code}")
+    if detail:
+        lines.append(detail)
+    return "\n".join(lines)
+
+
+def _post_webhook_json(url: str, payload: dict[str, Any], *, timeout_sec: float) -> None:
+    req = urllib.request.Request(
+        url=url,
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
+        code = getattr(resp, "status", None)
+        if code is None:
+            code = resp.getcode()
+        if code >= 400:
+            raise RuntimeError(f"webhook status={code}")
+
+
+def _send_webhook_alert_best_effort(
+    *,
+    event: str,
+    level: str = "ERROR",
+    detail: str = "",
+    cfg_path: str | None = None,
+    product_code: str | None = None,
+) -> None:
+    if not _env_bool("LIVE_ALERT_ENABLED", True):
+        return
+    url = _resolve_alert_webhook_url()
+    if not url:
+        return
+
+    timeout_sec = _env_float("LIVE_ALERT_TIMEOUT_SEC") or 5.0
+    timeout_sec = max(1.0, float(timeout_sec))
+    text = _build_alert_text(
+        event=event,
+        level=level,
+        detail=detail,
+        cfg_path=cfg_path,
+        product_code=product_code,
+    )
+    url_lower = url.lower()
+    is_discord = "discord.com/api/webhooks/" in url_lower or "discordapp.com/api/webhooks/" in url_lower
+    is_slack = "hooks.slack.com/" in url_lower
+    if is_discord:
+        payload: dict[str, Any] = {"content": text}
+    elif is_slack:
+        payload = {"text": text}
+    else:
+        payload = {"content": text, "text": text}
+    username = os.getenv("LIVE_ALERT_USERNAME") or os.getenv("ALERT_WEBHOOK_USERNAME")
+    if username and not is_slack:
+        payload["username"] = username
+
+    try:
+        _post_webhook_json(url, payload, timeout_sec=timeout_sec)
+        logger.info("WEBHOOK_ALERT_SENT event={} level={}", event, level)
+    except Exception as exc:
+        logger.warning(f"WEBHOOK_ALERT_FAILED event={event} err={exc}")
+
+
+async def _send_webhook_alert(
+    *,
+    event: str,
+    level: str = "ERROR",
+    detail: str = "",
+    cfg_path: str | None = None,
+    product_code: str | None = None,
+) -> None:
+    await asyncio.to_thread(
+        _send_webhook_alert_best_effort,
+        event=event,
+        level=level,
+        detail=detail,
+        cfg_path=cfg_path,
+        product_code=product_code,
+    )
 
 
 def _positions_to_net(positions: Any) -> tuple[Decimal, Optional[Decimal], int]:
@@ -345,6 +460,18 @@ async def _run_trade(
                 startup["cancel_requested"],
                 startup["active_after"],
             )
+            if startup["active_after"] > 0:
+                await _send_webhook_alert(
+                    event="STARTUP_ACTIVE_ORDERS_REMAIN",
+                    level="WARN",
+                    detail=(
+                        f"active_before={startup['active_before']} "
+                        f"cancel_requested={startup['cancel_requested']} "
+                        f"active_after={startup['active_after']}"
+                    ),
+                    cfg_path=cfg_path,
+                    product_code=cfg.exchange.product_code,
+                )
         else:
             await executor.poll(now=datetime.now(tz=timezone.utc), force_reconcile=True)
             remain = executor.active_order_count()
@@ -605,6 +732,17 @@ async def _run_trade(
                             "SHUTDOWN_CLOSE_FAILED residual_position_btc={}",
                             exchange_pos_after,
                         )
+                        await _send_webhook_alert(
+                            event="SHUTDOWN_CLOSE_FAILED",
+                            level="ERROR",
+                            detail=(
+                                f"exchange_pos_before={exchange_pos_before} "
+                                f"exchange_pos_after={exchange_pos_after} "
+                                f"close_retry_max={close_retry_max}"
+                            ),
+                            cfg_path=cfg_path,
+                            product_code=cfg.exchange.product_code,
+                        )
                 else:
                     logger.info("SHUTDOWN_CLOSE_SKIP residual_position_btc=0")
                 await executor.poll(now=now, force_reconcile=True)
@@ -692,6 +830,14 @@ def main() -> None:
         return
     except asyncio.CancelledError:
         return
+    except Exception as exc:
+        _send_webhook_alert_best_effort(
+            event="RUN_LIVE_FATAL",
+            level="ERROR",
+            detail=f"{type(exc).__name__}: {exc}",
+            cfg_path=args.override,
+        )
+        raise
 
 
 if __name__ == "__main__":

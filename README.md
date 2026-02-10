@@ -20,6 +20,8 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` / `RUN_LIVE_CONFIRM` で起動引数を上書き可能（`RUN_LIVE_CONFIRM` 未指定時は `I_UNDERSTAND` を既定使用）。既定で二重起動防止を行い、必要な場合のみ `RUN_LIVE_ALLOW_MULTI=true` で無効化。
 - liveログはローテーション/保持を有効化（既定: `LIVE_LOG_ROTATION=200 MB`, `LIVE_LOG_RETENTION=14 days`, `LIVE_LOG_COMPRESSION=zip`）。
 - `run_live_drycheck.ps1` は短時間実行で `PROMOTE_GUARD pass=false`（期待値）を確認する。安全側のため起動時 `LIVE_CANCEL_ACTIVE_ON_START=false` を設定してから実行する。
+- 異常時通知は `LIVE_ALERT_WEBHOOK_URL`（または `ALERT_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` / `SLACK_WEBHOOK_URL`）を設定すると有効。`SHUTDOWN_CLOSE_FAILED` / `RUN_LIVE_FATAL` などで Webhook 通知する。`LIVE_ALERT_ENABLED=false` で無効化可能。
+- `run_live_guard_ok.ps1` では `RUN_LIVE_ALERT_WEBHOOK_URL` を設定すると `LIVE_ALERT_WEBHOOK_URL` として引き渡せる。
 
 ## ディレクトリ
 - `configs/` … YAML 設定
