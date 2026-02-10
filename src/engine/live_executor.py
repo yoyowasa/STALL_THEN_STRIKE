@@ -48,6 +48,8 @@ class LiveExecutor:
         self.reconcile_interval_sec = max(1.0, reconcile_interval_sec)
         self._orders: dict[str, LiveOrder] = {}
         self._tag_by_oid: dict[str, str] = {}
+        self._tag_seen_mono: dict[str, float] = {}
+        self.tag_cache_ttl_sec = 3600.0
         self._last_reconcile_mono = 0.0
 
     @property
@@ -66,11 +68,12 @@ class LiveExecutor:
             return data
         tag = str(data.get("tag") or "")
         if tag:
-            self._tag_by_oid[oid] = tag
+            self._remember_tag(oid, tag)
             return data
         mapped = self._tag_by_oid.get(oid)
         if mapped:
             data["tag"] = mapped
+            self._tag_seen_mono[oid] = time.monotonic()
         return data
 
     def on_child_event(self, event: dict[str, Any]) -> None:
@@ -86,7 +89,7 @@ class LiveExecutor:
             tag = str(data.get("tag") or self._tag_by_oid.get(oid) or "")
             if not tag:
                 return
-            self._tag_by_oid[oid] = tag
+            self._remember_tag(oid, tag)
             side: Side = "BUY" if str(data.get("side") or "BUY") == "BUY" else "SELL"
             size = _as_decimal(data.get("outstanding_size"))
             if size is None:
@@ -112,12 +115,10 @@ class LiveExecutor:
             order.remaining = max(Decimal("0"), outstanding)
             if order.remaining <= 0:
                 self._orders.pop(oid, None)
-                self._tag_by_oid.pop(oid, None)
             return
 
         if et in {"CANCEL", "EXPIRE", "ORDER_FAILED", "REJECTED"}:
             self._orders.pop(oid, None)
-            self._tag_by_oid.pop(oid, None)
 
     async def execute(
         self,
@@ -157,9 +158,11 @@ class LiveExecutor:
     async def poll(self, *, now: datetime, force_reconcile: bool = False) -> None:
         now_mono = time.monotonic()
         if not force_reconcile and (now_mono - self._last_reconcile_mono) < self.reconcile_interval_sec:
+            self._prune_tag_cache(now_mono=now_mono)
             return
         await self._reconcile_active()
         self._last_reconcile_mono = now_mono
+        self._prune_tag_cache(now_mono=now_mono)
 
     async def cancel_active_orders_on_start(
         self,
@@ -218,7 +221,7 @@ class LiveExecutor:
         if not oid:
             raise RuntimeError(f"send_limit_order response missing id: {res}")
         if tag:
-            self._tag_by_oid[oid] = tag
+            self._remember_tag(oid, tag)
         self._orders[oid] = LiveOrder(
             oid=oid,
             child_order_id="",
@@ -248,7 +251,7 @@ class LiveExecutor:
         if not oid:
             raise RuntimeError(f"send_market_order response missing id: {res}")
         if tag:
-            self._tag_by_oid[oid] = tag
+            self._remember_tag(oid, tag)
 
     async def _fetch_active_orders(self, *, count: int = 100) -> list[dict[str, Any]]:
         try:
@@ -281,7 +284,7 @@ class LiveExecutor:
 
             mapped_tag = self._tag_by_oid.get(oid) or str(row.get("tag") or "")
             if mapped_tag:
-                self._tag_by_oid[oid] = mapped_tag
+                self._remember_tag(oid, mapped_tag)
 
             order = self._orders.get(oid)
             if order is None:
@@ -311,4 +314,19 @@ class LiveExecutor:
             if oid in active_ids:
                 continue
             self._orders.pop(oid, None)
+
+    def _remember_tag(self, oid: str, tag: str) -> None:
+        if not oid or not tag:
+            return
+        self._tag_by_oid[oid] = tag
+        self._tag_seen_mono[oid] = time.monotonic()
+
+    def _prune_tag_cache(self, *, now_mono: float) -> None:
+        cutoff = now_mono - self.tag_cache_ttl_sec
+        for oid, seen in list(self._tag_seen_mono.items()):
+            if oid in self._orders:
+                continue
+            if seen >= cutoff:
+                continue
+            self._tag_seen_mono.pop(oid, None)
             self._tag_by_oid.pop(oid, None)

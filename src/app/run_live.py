@@ -583,6 +583,29 @@ async def _run_trade(
         def _check_consistency() -> bool:
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
 
+        def _sync_strategy_open_orders(now: datetime) -> None:
+            active_rows: list[dict[str, Any]] = []
+            for order in executor.active_orders.values():
+                if order.tag != strategy.tag:
+                    continue
+                active_rows.append(
+                    {
+                        "oid": order.oid,
+                        "side": order.side,
+                        "remaining": order.remaining,
+                        "price": order.price,
+                    }
+                )
+            removed, added = strategy.reconcile_open_orders(active_orders=active_rows, now=now)
+            if removed or added:
+                logger.warning(
+                    "OPEN_ORDER_SYNC removed={} added={} strategy_open={} executor_active={}",
+                    removed,
+                    added,
+                    strategy.open_order_count,
+                    executor.active_order_count(tag=strategy.tag),
+                )
+
         async def _consume_ws_events(mux: WsMux) -> None:
             while True:
                 try:
@@ -641,6 +664,7 @@ async def _run_trade(
                     now_mono = time.monotonic()
 
                     await executor.poll(now=now)
+                    _sync_strategy_open_orders(now)
 
                     if now_mono - last_eval >= eval_interval:
                         last_eval = now_mono
@@ -689,6 +713,7 @@ async def _run_trade(
                             logger.exception("注文実行で例外が発生しました。")
 
                         await executor.poll(now=now)
+                        _sync_strategy_open_orders(now)
 
                         if actions or (meta.decision_type != (last_decision_type or "idle")):
                             st = inventory.pnl.state

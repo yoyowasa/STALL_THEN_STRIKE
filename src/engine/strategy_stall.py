@@ -98,16 +98,67 @@ class StallThenStrikeStrategy:
     def ca_gate_stats(self) -> tuple[int, int, int]:
         return self._ca_gate_total, self._ca_gate_allow, self._ca_gate_block
 
+    def reconcile_open_orders(
+        self,
+        *,
+        active_orders: list[dict[str, Any]],
+        now: datetime,
+    ) -> tuple[int, int]:
+        """Align local open-order view with executor's reconciled active orders."""
+        desired: dict[str, _OpenOrder] = {}
+        default_expire = now + timedelta(milliseconds=int(self.cfg.ttl_ms))
+        for row in active_orders:
+            if not isinstance(row, dict):
+                continue
+            oid = str(row.get("oid") or "")
+            if not oid:
+                continue
+            side: Side = "BUY" if str(row.get("side") or "BUY") == "BUY" else "SELL"
+            rem = row.get("remaining")
+            size = Decimal(str(rem if rem is not None else row.get("size") or "0"))
+            price = Decimal(str(row.get("price") or "0"))
+            desired[oid] = _OpenOrder(
+                oid=oid,
+                side=side,
+                size=max(Decimal("0"), size),
+                price=price,
+                tag=self.tag,
+                expire_at=default_expire,
+            )
+
+        removed = 0
+        for oid in list(self._open.keys()):
+            if oid in desired:
+                continue
+            self._open.pop(oid, None)
+            removed += 1
+
+        added = 0
+        for oid, order in desired.items():
+            current = self._open.get(oid)
+            if current is None:
+                self._open[oid] = order
+                added += 1
+                continue
+            current.side = order.side
+            current.size = order.size
+            current.price = order.price
+            current.expire_at = order.expire_at
+
+        return removed, added
+
     def on_order_event(self, evt: dict, *, now: datetime) -> None:
-        tag = str(evt.get("tag") or "")
-        if tag != self.tag:
-            return
         oid = str(evt.get("child_order_acceptance_id") or "")
         if not oid:
             return
-
         et = str(evt.get("event_type") or "")
+        tag = str(evt.get("tag") or "")
+        is_our_tag = tag == self.tag
+        is_known_oid = oid in self._open
+
         if et == "ORDER":
+            if not is_our_tag:
+                return
             expire_at = now + timedelta(milliseconds=int(self.cfg.ttl_ms))
             if isinstance(evt.get("expire_date"), str):
                 try:
@@ -122,9 +173,18 @@ class StallThenStrikeStrategy:
                 tag=tag,
                 expire_at=expire_at,
             )
-        elif et == "CANCEL":
+            return
+
+        # Some child_order_events arrive without tag; process terminal updates
+        # if oid is already tracked locally.
+        if not (is_our_tag or is_known_oid):
+            return
+
+        if et in {"CANCEL", "EXPIRE", "ORDER_FAILED", "REJECTED"}:
             self._open.pop(oid, None)
-        elif et == "EXECUTION":
+            return
+
+        if et == "EXECUTION":
             outstanding = evt.get("outstanding_size")
             if outstanding is not None:
                 try:
