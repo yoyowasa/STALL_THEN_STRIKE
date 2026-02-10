@@ -10,6 +10,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - リアル口座: `python -m src.app.run_live --override configs/live.yml --duration-sec 0`
 - ペーパー運用ラッパ: `powershell -File .\\run_paper_guard_ok.ps1`
 - リアル運用ラッパ: `powershell -File .\\run_live_guard_ok.ps1`
+- リアル本番起動（1コマンド）: `powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_live_start.ps1 -AlertWebhookUrl "<WebhookURL>"`
 - 実運用前ドライチェック（1コマンド）: `powershell -NoProfile -ExecutionPolicy Bypass -File .\\run_live_drycheck.ps1`
 
 ### 補足（live）
@@ -18,6 +19,7 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - 起動時に `ACTIVE` 注文を回収してキャンセルする（既定）。無効化する場合は `LIVE_CANCEL_ACTIVE_ON_START=false` を設定。
 - 終了時の成行クローズは再試行する（既定3回）。`LIVE_CLOSE_MAX_RETRY` / `LIVE_CLOSE_RETRY_WAIT_SEC` で調整可能。
 - `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` / `RUN_LIVE_CONFIRM` で起動引数を上書き可能（`RUN_LIVE_CONFIRM` 未指定時は `I_UNDERSTAND` を既定使用）。既定で二重起動防止を行い、必要な場合のみ `RUN_LIVE_ALLOW_MULTI=true` で無効化。
+- `run_live_start.ps1` は本番起動の固定手順ラッパ。`-Override` / `-DurationSec` / `-AlertWebhookUrl` を受け取り、内部で `run_live_guard_ok.ps1` を実行する。
 - liveログはローテーション/保持を有効化（既定: `LIVE_LOG_ROTATION=200 MB`, `LIVE_LOG_RETENTION=14 days`, `LIVE_LOG_COMPRESSION=zip`）。
 - `run_live_drycheck.ps1` は短時間実行で `PROMOTE_GUARD pass=false`（期待値）を確認する。安全側のため起動時 `LIVE_CANCEL_ACTIVE_ON_START=false` を設定してから実行する。
 - 異常時通知は `LIVE_ALERT_WEBHOOK_URL`（または `ALERT_WEBHOOK_URL` / `DISCORD_WEBHOOK_URL` / `SLACK_WEBHOOK_URL`）を設定すると有効。`SHUTDOWN_CLOSE_FAILED` / `RUN_LIVE_FATAL` などで Webhook 通知する。`LIVE_ALERT_ENABLED=false` で無効化可能。
