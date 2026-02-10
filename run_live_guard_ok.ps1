@@ -20,8 +20,11 @@ if (-not (Test-Path $pythonExe)) {
   exit 4
 }
 
+$override = if ($env:RUN_LIVE_OVERRIDE) { $env:RUN_LIVE_OVERRIDE } else { "configs/live.yml" }
+$durationSec = if ($env:RUN_LIVE_DURATION_SEC) { $env:RUN_LIVE_DURATION_SEC } else { "0" }
+
 $proc = Start-Process -FilePath $pythonExe `
-  -ArgumentList @("-m", "src.app.run_live") `
+  -ArgumentList @("-m", "src.app.run_live", "--override", $override, "--duration-sec", $durationSec) `
   -WorkingDirectory "C:\BOT\stall_then_strike" `
   -NoNewWindow -Wait -PassThru
 [int]$pyExit = $proc.ExitCode

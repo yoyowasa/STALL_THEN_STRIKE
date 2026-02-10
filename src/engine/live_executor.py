@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -160,6 +161,41 @@ class LiveExecutor:
         await self._reconcile_active()
         self._last_reconcile_mono = now_mono
 
+    async def cancel_active_orders_on_start(
+        self,
+        *,
+        settle_retry: int = 5,
+        settle_interval_sec: float = 0.5,
+        max_count: int = 500,
+    ) -> dict[str, int]:
+        active = await self._fetch_active_orders(count=max_count)
+        before = len(active)
+        cancel_requested = 0
+        for row in active:
+            oid = str(row.get("child_order_acceptance_id") or "")
+            if not oid:
+                continue
+            try:
+                await self.http.cancel_order(oid, product_code=self.product_code)
+                cancel_requested += 1
+            except Exception as exc:
+                logger.warning(f"startup cancel failed oid={oid} err={exc}")
+
+        after = before
+        for _ in range(max(1, settle_retry)):
+            await asyncio.sleep(max(0.1, settle_interval_sec))
+            active_now = await self._fetch_active_orders(count=max_count)
+            after = len(active_now)
+            if after == 0:
+                break
+
+        await self._reconcile_active()
+        return {
+            "active_before": before,
+            "cancel_requested": cancel_requested,
+            "active_after": after,
+        }
+
     async def _place_limit(
         self,
         *,
@@ -214,19 +250,27 @@ class LiveExecutor:
         if tag:
             self._tag_by_oid[oid] = tag
 
-    async def _reconcile_active(self) -> None:
+    async def _fetch_active_orders(self, *, count: int = 100) -> list[dict[str, Any]]:
         try:
             active = await self.http.get_child_orders(
                 product_code=self.product_code,
                 child_order_state="ACTIVE",
-                count=100,
+                count=count,
             )
         except Exception as exc:
             logger.warning(f"get_child_orders failed: {exc}")
-            return
+            return []
         if not isinstance(active, list):
             logger.warning(f"get_child_orders unexpected response: {active}")
-            return
+            return []
+        out: list[dict[str, Any]] = []
+        for row in active:
+            if isinstance(row, dict):
+                out.append(row)
+        return out
+
+    async def _reconcile_active(self) -> None:
+        active = await self._fetch_active_orders(count=100)
 
         active_ids: set[str] = set()
         for row in active:
@@ -240,22 +284,25 @@ class LiveExecutor:
                 self._tag_by_oid[oid] = mapped_tag
 
             order = self._orders.get(oid)
-            if order is None and mapped_tag:
+            if order is None:
                 side: Side = "BUY" if str(row.get("side") or "BUY") == "BUY" else "SELL"
                 size = _as_decimal(row.get("size")) or Decimal("0")
                 rem = _as_decimal(row.get("outstanding_size")) or size
+                tag = mapped_tag or "__unknown__"
                 self._orders[oid] = LiveOrder(
                     oid=oid,
                     child_order_id=str(row.get("child_order_id") or ""),
                     side=side,
                     price=_as_decimal(row.get("price")),
                     remaining=max(Decimal("0"), rem),
-                    tag=mapped_tag,
+                    tag=tag,
                     created_at=datetime.now(tz=timezone.utc),
                 )
                 continue
 
             if order is not None:
+                if mapped_tag and order.tag == "__unknown__":
+                    order.tag = mapped_tag
                 rem = _as_decimal(row.get("outstanding_size"))
                 if rem is not None:
                     order.remaining = max(Decimal("0"), rem)

@@ -20,6 +20,11 @@ class BitflyerHttp:
         resp = await self.client.get("/v1/me/getcollateral")
         return await resp.json(content_type=None)
 
+    async def get_positions(self, *, product_code: Optional[str] = None) -> Any:
+        params = {"product_code": product_code or self.exchange_cfg.product_code}
+        resp = await self.client.get("/v1/me/getpositions", params=params)
+        return await resp.json(content_type=None)
+
     async def get_board(self, product_code: Optional[str] = None) -> Any:
         params = {"product_code": product_code or self.exchange_cfg.product_code}
         resp = await self.client.get("/v1/getboard", params=params)

@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+import os
 import time
 from datetime import datetime, timezone
 from decimal import Decimal
@@ -44,6 +45,68 @@ def _live_channels(product_code: str, base_channels: list[str]) -> list[str]:
     )
 
 
+def _env_bool(name: str, default: bool) -> bool:
+    val = os.getenv(name)
+    if val is None:
+        return default
+    norm = val.strip().lower()
+    if norm in {"1", "true", "yes", "on"}:
+        return True
+    if norm in {"0", "false", "no", "off"}:
+        return False
+    return default
+
+
+async def _sync_inventory_from_exchange(
+    *,
+    http: BitflyerHttp,
+    product_code: str,
+    inventory: InventoryManager,
+    strategy: StallThenStrikeStrategy,
+) -> tuple[Decimal, Optional[Decimal], int]:
+    positions = await http.get_positions(product_code=product_code)
+    if not isinstance(positions, list):
+        logger.warning(f"get_positions unexpected response: {positions}")
+        return Decimal("0"), None, 0
+
+    net = Decimal("0")
+    signed_notional = Decimal("0")
+    rows = 0
+    for row in positions:
+        if not isinstance(row, dict):
+            continue
+        side = str(row.get("side") or "")
+        if side not in {"BUY", "SELL"}:
+            continue
+        size = Decimal(str(row.get("size") or "0"))
+        price = Decimal(str(row.get("price") or "0"))
+        if size <= 0 or price <= 0:
+            continue
+        sign = Decimal("1") if side == "BUY" else Decimal("-1")
+        net += sign * size
+        signed_notional += sign * size * price
+        rows += 1
+
+    if net == 0:
+        return Decimal("0"), None, rows
+
+    avg_price = abs(signed_notional / net) if net != 0 else None
+    if avg_price is None or avg_price <= 0:
+        avg_price = Decimal("0")
+    fill_side: Side = "BUY" if net > 0 else "SELL"
+    fill = FillEvent(
+        ts=datetime.now(tz=timezone.utc),
+        order_id="bootstrap-position",
+        side=fill_side,
+        price=avg_price,
+        size=abs(net),
+        tag="bootstrap",
+    )
+    inventory.apply_fill(fill)
+    strategy.on_fill(fill)
+    return net, avg_price, rows
+
+
 async def _run_listen(cfg_path: str | None, duration_sec: int) -> None:
     cfg = load_app_config("configs/base.yml", cfg_path)
     _setup_logging()
@@ -65,11 +128,15 @@ async def _run_listen(cfg_path: str | None, duration_sec: int) -> None:
             tick_size=Decimal("1"),
         )
 
-        end = datetime.now(tz=timezone.utc).timestamp() + duration_sec
+        end = (
+            None
+            if duration_sec <= 0
+            else datetime.now(tz=timezone.utc).timestamp() + duration_sec
+        )
         last_best: tuple[Decimal | None, Decimal | None] | None = None
         async with WsMux(store, product_code=cfg.exchange.product_code) as mux:
             try:
-                while datetime.now(tz=timezone.utc).timestamp() < end:
+                while end is None or datetime.now(tz=timezone.utc).timestamp() < end:
                     evt = await mux.get(timeout=10)
                     if evt.kind == "board":
                         snap = ob_view.snapshot(datetime.now(tz=timezone.utc))
@@ -172,7 +239,7 @@ async def _run_trade(
             metrics=metrics,
         )
 
-        end_mono = time.monotonic() + duration_sec
+        end_mono = None if duration_sec <= 0 else time.monotonic() + duration_sec
         last_eval = 0.0
         eval_interval = max(1, eval_interval_ms) / 1000.0
         last_summary = 0.0
@@ -218,6 +285,40 @@ async def _run_trade(
             http,
             product_code=cfg.exchange.product_code,
             reconcile_interval_sec=5.0,
+        )
+
+        cancel_active_on_start = _env_bool("LIVE_CANCEL_ACTIVE_ON_START", True)
+        if cancel_active_on_start:
+            startup = await executor.cancel_active_orders_on_start(
+                settle_retry=5,
+                settle_interval_sec=0.5,
+                max_count=500,
+            )
+            logger.info(
+                "STARTUP_ACTIVE_ORDERS active_before={} cancel_requested={} active_after={}",
+                startup["active_before"],
+                startup["cancel_requested"],
+                startup["active_after"],
+            )
+        else:
+            await executor.poll(now=datetime.now(tz=timezone.utc), force_reconcile=True)
+            remain = executor.active_order_count()
+            logger.warning(
+                "LIVE_CANCEL_ACTIVE_ON_START=false のため既存ACTIVE注文を維持します "
+                f"(active_count={remain})"
+            )
+
+        net_pos, avg_pos, pos_rows = await _sync_inventory_from_exchange(
+            http=http,
+            product_code=cfg.exchange.product_code,
+            inventory=inventory,
+            strategy=strategy,
+        )
+        logger.info(
+            "STARTUP_POSITION_SYNC positions_rows={} net_position_btc={} avg_price={}",
+            pos_rows,
+            net_pos,
+            avg_pos,
         )
 
         entry_actual = _guard_actual(
@@ -307,7 +408,7 @@ async def _run_trade(
             ws_task = asyncio.create_task(_consume_ws_events(mux))
             cancelled = False
             try:
-                while time.monotonic() < end_mono:
+                while end_mono is None or time.monotonic() < end_mono:
                     now = datetime.now(tz=timezone.utc)
                     now_mono = time.monotonic()
 
@@ -473,7 +574,12 @@ def main() -> None:
         help="Override config YAML (default: configs/live.yml)",
     )
     parser.add_argument("--mode", choices=["trade", "listen"], default="trade")
-    parser.add_argument("--duration-sec", type=int, default=60)
+    parser.add_argument(
+        "--duration-sec",
+        type=int,
+        default=0,
+        help="0 以下で無期限実行（default: 0）",
+    )
     parser.add_argument("--eval-interval-ms", type=int, default=50)
     parser.add_argument("--summary-interval-sec", type=int, default=10)
     args = parser.parse_args()

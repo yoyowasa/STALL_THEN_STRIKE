@@ -7,9 +7,14 @@ bitFlyer Crypto CFD `FX_BTC_JPY` 向けの「Best が静止したら両面で一
 - `.env` を `.env.example` から複製し API キーをセット。
 - `configs/base.yml` を基礎に `configs/live.yml` / `configs/paper.yml` で環境を上書き。
 - ペーパー: `python -m src.app.run_paper --override configs/paper.yml`
-- リアル口座: `python -m src.app.run_live --override configs/live.yml`
+- リアル口座: `python -m src.app.run_live --override configs/live.yml --duration-sec 0`
 - ペーパー運用ラッパ: `powershell -File .\\run_paper_guard_ok.ps1`
 - リアル運用ラッパ: `powershell -File .\\run_live_guard_ok.ps1`
+
+### 補足（live）
+- `run_live` は `--duration-sec 0`（既定値）で無期限実行。
+- 起動時に `ACTIVE` 注文を回収してキャンセルする（既定）。無効化する場合は `LIVE_CANCEL_ACTIVE_ON_START=false` を設定。
+- `run_live_guard_ok.ps1` は `RUN_LIVE_DURATION_SEC` / `RUN_LIVE_OVERRIDE` で起動引数を上書き可能。
 
 ## ディレクトリ
 - `configs/` … YAML 設定
