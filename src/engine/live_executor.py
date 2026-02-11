@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,15 +43,27 @@ class LiveExecutor:
         *,
         product_code: str,
         reconcile_interval_sec: float = 5.0,
+        http_min_interval_sec: Optional[float] = None,
     ) -> None:
         self.http = http
         self.product_code = product_code
         self.reconcile_interval_sec = max(1.0, reconcile_interval_sec)
+        if http_min_interval_sec is None:
+            raw = os.getenv("LIVE_HTTP_MIN_INTERVAL_SEC")
+            try:
+                http_min_interval_sec = float(raw) if raw is not None else 0.2
+            except Exception:
+                http_min_interval_sec = 0.2
+        self.http_min_interval_sec = max(0.0, float(http_min_interval_sec))
+        self._http_lock = asyncio.Lock()
+        self._http_last_mono = 0.0
         self._orders: dict[str, LiveOrder] = {}
         self._tag_by_oid: dict[str, str] = {}
         self._tag_seen_mono: dict[str, float] = {}
         self.tag_cache_ttl_sec = 3600.0
         self._last_reconcile_mono = 0.0
+        if self.http_min_interval_sec > 0:
+            logger.info("LIVE_HTTP_MIN_INTERVAL_SEC={}", self.http_min_interval_sec)
 
     @property
     def active_orders(self) -> dict[str, LiveOrder]:
@@ -179,7 +192,7 @@ class LiveExecutor:
             if not oid:
                 continue
             try:
-                await self.http.cancel_order(oid, product_code=self.product_code)
+                await self._cancel_order(oid)
                 cancel_requested += 1
             except Exception as exc:
                 logger.warning(f"startup cancel failed oid={oid} err={exc}")
@@ -209,6 +222,7 @@ class LiveExecutor:
         tag: str,
         now: datetime,
     ) -> None:
+        await self._await_http_slot()
         res = await self.http.send_limit_order(
             side=side,
             price=int(price),
@@ -236,11 +250,12 @@ class LiveExecutor:
         cancel_oids = [oid for oid, order in self._orders.items() if order.tag == tag]
         for oid in cancel_oids:
             try:
-                await self.http.cancel_order(oid, product_code=self.product_code)
+                await self._cancel_order(oid)
             except Exception as exc:
                 logger.warning(f"cancel_order failed oid={oid} err={exc}")
 
     async def _close_market(self, *, side: Side, size: Decimal, tag: str) -> None:
+        await self._await_http_slot()
         res = await self.http.send_market_order(
             side=side,
             size=float(size),
@@ -255,6 +270,7 @@ class LiveExecutor:
 
     async def _fetch_active_orders(self, *, count: int = 100) -> list[dict[str, Any]]:
         try:
+            await self._await_http_slot()
             active = await self.http.get_child_orders(
                 product_code=self.product_code,
                 child_order_state="ACTIVE",
@@ -330,3 +346,17 @@ class LiveExecutor:
                 continue
             self._tag_seen_mono.pop(oid, None)
             self._tag_by_oid.pop(oid, None)
+
+    async def _await_http_slot(self) -> None:
+        if self.http_min_interval_sec <= 0:
+            return
+        async with self._http_lock:
+            now_mono = time.monotonic()
+            wait_sec = self.http_min_interval_sec - (now_mono - self._http_last_mono)
+            if wait_sec > 0:
+                await asyncio.sleep(wait_sec)
+            self._http_last_mono = time.monotonic()
+
+    async def _cancel_order(self, oid: str) -> Any:
+        await self._await_http_slot()
+        return await self.http.cancel_order(oid, product_code=self.product_code)

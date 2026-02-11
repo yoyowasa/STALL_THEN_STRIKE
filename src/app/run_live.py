@@ -96,6 +96,40 @@ def _trim_recent_errors(
     return len(samples)
 
 
+def _filter_actions_by_interval(
+    actions: list[Action],
+    *,
+    now_mono: float,
+    min_interval_by_kind: dict[str, float],
+    last_sent_mono_by_kind: dict[str, float],
+) -> tuple[list[Action], dict[str, int]]:
+    if not actions:
+        return actions, {}
+
+    allowed_kind: dict[str, bool] = {}
+    blocked: dict[str, int] = {}
+    out: list[Action] = []
+    for action in actions:
+        kind = action.kind
+        allowed = allowed_kind.get(kind)
+        if allowed is None:
+            min_interval = max(0.0, float(min_interval_by_kind.get(kind, 0.0)))
+            if min_interval <= 0:
+                allowed = True
+            else:
+                last = last_sent_mono_by_kind.get(kind, -1e18)
+                allowed = (now_mono - last) >= min_interval
+                if allowed:
+                    last_sent_mono_by_kind[kind] = now_mono
+            allowed_kind[kind] = allowed
+
+        if allowed:
+            out.append(action)
+        else:
+            blocked[kind] = blocked.get(kind, 0) + 1
+    return out, blocked
+
+
 def _is_self_trade_error(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     visited: set[int] = set()
@@ -530,6 +564,27 @@ async def _run_trade(
         guard_cooldown_sec = _env_float("ENTRY_GUARD_COOLDOWN_SEC") or 0.0
         api_limit_backoff_sec = _env_float("LIVE_API_LIMIT_BACKOFF_SEC") or 1.5
         api_limit_backoff_sec = max(0.2, float(api_limit_backoff_sec))
+        api_limit_halt_window_sec = _env_float("LIVE_API_LIMIT_HALT_WINDOW_SEC") or 30.0
+        api_limit_halt_window_sec = max(1.0, float(api_limit_halt_window_sec))
+        api_limit_halt_threshold = max(1, _env_int("LIVE_API_LIMIT_HALT_THRESHOLD", 25))
+        api_limit_halt_cooldown_sec = _env_float("LIVE_API_LIMIT_HALT_COOLDOWN_SEC") or 30.0
+        api_limit_halt_cooldown_sec = max(5.0, float(api_limit_halt_cooldown_sec))
+        api_limit_halt_new_orders = _env_bool("LIVE_API_LIMIT_HALT_NEW_ORDERS", True)
+
+        place_min_interval_sec = _env_float("LIVE_PLACE_MIN_INTERVAL_SEC")
+        cancel_min_interval_sec = _env_float("LIVE_CANCEL_MIN_INTERVAL_SEC")
+        close_min_interval_sec = _env_float("LIVE_CLOSE_MIN_INTERVAL_SEC")
+        action_min_interval_by_kind: dict[str, float] = {
+            "place_limit": max(0.0, float(place_min_interval_sec if place_min_interval_sec is not None else 0.35)),
+            "cancel_all_stall": max(
+                0.0,
+                float(cancel_min_interval_sec if cancel_min_interval_sec is not None else 0.5),
+            ),
+            "close_market": max(
+                0.0,
+                float(close_min_interval_sec if close_min_interval_sec is not None else 0.8),
+            ),
+        }
         dust_alert_interval_sec = _env_float("LIVE_DUST_ALERT_INTERVAL_SEC") or 120.0
         dust_alert_interval_sec = max(10.0, float(dust_alert_interval_sec))
         dust_normalize_enabled = _env_bool("LIVE_DUST_NORMALIZE_ENABLED", True)
@@ -714,6 +769,11 @@ async def _run_trade(
         entry_guard_enforce_last_reason = ""
         dust_last_alert_mono = 0.0
         dust_normalize_last_attempt_mono = -1e9
+        api_limit_recent_mono: deque[float] = deque()
+        api_limit_halt_until_mono = 0.0
+        api_limit_halt_last_log_mono = 0.0
+        action_last_sent_mono_by_kind: dict[str, float] = {}
+        action_throttle_last_log_mono = 0.0
 
         def _check_consistency() -> bool:
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
@@ -742,6 +802,7 @@ async def _run_trade(
                 )
 
         async def _handle_known_action_exception(exc: BaseException, *, context: str) -> bool:
+            nonlocal api_limit_halt_until_mono
             if _is_self_trade_error(exc):
                 logger.warning(
                     "{} self-trade detected; skip guard error increment err={}",
@@ -757,6 +818,24 @@ async def _run_trade(
                 )
                 return True
             if _is_api_limit_error(exc):
+                now_mono = time.monotonic()
+                api_limit_recent_mono.append(now_mono)
+                recent_api_limit = _trim_recent_errors(
+                    api_limit_recent_mono,
+                    now_mono=now_mono,
+                    window_sec=api_limit_halt_window_sec,
+                )
+                if api_limit_halt_new_orders and recent_api_limit >= api_limit_halt_threshold:
+                    new_until = now_mono + api_limit_halt_cooldown_sec
+                    if new_until > api_limit_halt_until_mono:
+                        api_limit_halt_until_mono = new_until
+                        logger.error(
+                            "API_LIMIT_HALT_ENTER context={} recent_api_limit={} window_sec={} cooldown_sec={}",
+                            context,
+                            recent_api_limit,
+                            api_limit_halt_window_sec,
+                            api_limit_halt_cooldown_sec,
+                        )
                 logger.warning(
                     "{} api-limit detected; skip guard error increment and backoff {} sec err={}",
                     context,
@@ -926,6 +1005,20 @@ async def _run_trade(
                                 dust_last_alert_mono = now_mono
                             await _maybe_normalize_dust(now=now, now_mono=now_mono, snap=snap)
 
+                        if api_limit_halt_new_orders and now_mono < api_limit_halt_until_mono:
+                            blocked = [a for a in actions if a.kind == "place_limit"]
+                            if blocked:
+                                actions = [a for a in actions if a.kind != "place_limit"]
+                                entry_guard_blocked_place_limit_total += len(blocked)
+                                entry_guard_enforce_last_reason = "api_limit_halt"
+                                if now_mono - api_limit_halt_last_log_mono >= 1.0:
+                                    logger.warning(
+                                        "API_LIMIT_HALT_ACTIVE remaining_sec={} blocked_place_limit={}",
+                                        round(api_limit_halt_until_mono - now_mono, 3),
+                                        len(blocked),
+                                    )
+                                    api_limit_halt_last_log_mono = now_mono
+
                         if any(a.kind == "place_limit" for a in actions):
                             guard_actual = _guard_actual(
                                 engine=engine,
@@ -959,6 +1052,20 @@ async def _run_trade(
                                 if entry_guard_last_pass is False:
                                     logger.info('ENTRY_GUARD_ENFORCE pass=true reason=""')
                                 entry_guard_last_pass = True
+
+                        actions, blocked_by_interval = _filter_actions_by_interval(
+                            actions,
+                            now_mono=now_mono,
+                            min_interval_by_kind=action_min_interval_by_kind,
+                            last_sent_mono_by_kind=action_last_sent_mono_by_kind,
+                        )
+                        if blocked_by_interval and (now_mono - action_throttle_last_log_mono) >= 1.0:
+                            logger.info(
+                                "ACTION_THROTTLE blocked={} min_interval_by_kind={}",
+                                blocked_by_interval,
+                                action_min_interval_by_kind,
+                            )
+                            action_throttle_last_log_mono = now_mono
 
                         try:
                             await executor.execute(actions, now=now, board=snap)

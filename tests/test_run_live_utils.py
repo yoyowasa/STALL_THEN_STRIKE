@@ -4,6 +4,7 @@ from decimal import Decimal
 from src.app.run_live import (
     _dust_normalize_plan,
     _env_bool,
+    _filter_actions_by_interval,
     _is_api_limit_error,
     _is_min_order_size_error,
     _is_self_trade_error,
@@ -12,6 +13,7 @@ from src.app.run_live import (
     _resolve_alert_webhook_url,
     _trim_recent_errors,
 )
+from src.types.dto import Action
 
 
 def test_env_bool_true_false(monkeypatch):
@@ -181,6 +183,55 @@ def test_dust_normalize_plan_none_for_non_dust():
         )
         is None
     )
+
+
+def test_filter_actions_by_interval_keeps_quote_pair_same_tick():
+    actions = [
+        Action(kind="place_limit", side="BUY", price=Decimal("100"), size=Decimal("0.001")),
+        Action(kind="place_limit", side="SELL", price=Decimal("101"), size=Decimal("0.001")),
+        Action(kind="cancel_all_stall", tag="stall"),
+    ]
+    mins = {"place_limit": 0.5, "cancel_all_stall": 0.5}
+    last: dict[str, float] = {}
+
+    kept, blocked = _filter_actions_by_interval(
+        actions,
+        now_mono=10.0,
+        min_interval_by_kind=mins,
+        last_sent_mono_by_kind=last,
+    )
+    assert len(kept) == 3
+    assert blocked == {}
+    assert last["place_limit"] == 10.0
+    assert last["cancel_all_stall"] == 10.0
+
+
+def test_filter_actions_by_interval_blocks_until_elapsed():
+    actions = [
+        Action(kind="place_limit", side="BUY", price=Decimal("100"), size=Decimal("0.001")),
+        Action(kind="place_limit", side="SELL", price=Decimal("101"), size=Decimal("0.001")),
+        Action(kind="close_market", side="SELL", size=Decimal("0.001")),
+    ]
+    mins = {"place_limit": 0.5, "close_market": 0.8}
+    last = {"place_limit": 10.0, "close_market": 10.0}
+
+    kept, blocked = _filter_actions_by_interval(
+        actions,
+        now_mono=10.2,
+        min_interval_by_kind=mins,
+        last_sent_mono_by_kind=last,
+    )
+    assert kept == []
+    assert blocked == {"place_limit": 2, "close_market": 1}
+
+    kept2, blocked2 = _filter_actions_by_interval(
+        actions,
+        now_mono=11.0,
+        min_interval_by_kind=mins,
+        last_sent_mono_by_kind=last,
+    )
+    assert len(kept2) == 3
+    assert blocked2 == {}
     assert (
         _dust_normalize_plan(
             side="flat",
