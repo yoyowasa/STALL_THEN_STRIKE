@@ -158,6 +158,16 @@ def _is_api_limit_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_api_limit_response(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    message = str(payload.get("error_message") or "").lower()
+    if "api limit" in message:
+        return True
+    status = payload.get("status")
+    return status == -1 and "over" in message and "limit" in message
+
+
 def _is_min_order_size_error(exc: BaseException) -> bool:
     cur: BaseException | None = exc
     visited: set[int] = set()
@@ -1183,39 +1193,256 @@ async def _run_trade(
                 close_retry_max = max(1, _env_int("LIVE_CLOSE_MAX_RETRY", 3))
                 close_retry_wait_sec = _env_float("LIVE_CLOSE_RETRY_WAIT_SEC") or 0.7
                 close_retry_wait_sec = max(0.2, float(close_retry_wait_sec))
+                shutdown_fetch_grace_sec = _env_float("LIVE_SHUTDOWN_FETCH_GRACE_SEC") or 2.0
+                shutdown_fetch_grace_sec = max(0.0, float(shutdown_fetch_grace_sec))
+                shutdown_unknown_confirm_timeout_sec = (
+                    _env_float("LIVE_SHUTDOWN_UNKNOWN_CONFIRM_TIMEOUT_SEC") or 90.0
+                )
+                shutdown_unknown_confirm_timeout_sec = max(
+                    5.0, float(shutdown_unknown_confirm_timeout_sec)
+                )
+                shutdown_unknown_confirm_interval_sec = (
+                    _env_float("LIVE_SHUTDOWN_UNKNOWN_CONFIRM_INTERVAL_SEC") or 3.0
+                )
+                shutdown_unknown_confirm_interval_sec = max(
+                    0.5, float(shutdown_unknown_confirm_interval_sec)
+                )
+                shutdown_unknown_confirm_backoff_multiplier = (
+                    _env_float("LIVE_SHUTDOWN_UNKNOWN_CONFIRM_BACKOFF_MULTIPLIER") or 1.8
+                )
+                shutdown_unknown_confirm_backoff_multiplier = max(
+                    1.0, float(shutdown_unknown_confirm_backoff_multiplier)
+                )
+                shutdown_unknown_confirm_backoff_max_sec = (
+                    _env_float("LIVE_SHUTDOWN_UNKNOWN_CONFIRM_BACKOFF_MAX_SEC") or 20.0
+                )
+                shutdown_unknown_confirm_backoff_max_sec = max(
+                    shutdown_unknown_confirm_interval_sec,
+                    float(shutdown_unknown_confirm_backoff_max_sec),
+                )
+                shutdown_dust_normalize_enabled = _env_bool(
+                    "LIVE_SHUTDOWN_DUST_NORMALIZE_ENABLED",
+                    True,
+                )
+                shutdown_dust_normalize_wait_sec = (
+                    _env_float("LIVE_SHUTDOWN_DUST_NORMALIZE_WAIT_SEC") or 0.8
+                )
+                shutdown_dust_normalize_wait_sec = max(
+                    0.1, float(shutdown_dust_normalize_wait_sec)
+                )
                 position_fetch_retry = max(1, _env_int("LIVE_POSITION_FETCH_RETRY", 5))
                 position_fetch_retry_wait_sec = (
                     _env_float("LIVE_POSITION_FETCH_RETRY_WAIT_SEC") or 1.0
                 )
                 position_fetch_retry_wait_sec = max(0.2, float(position_fetch_retry_wait_sec))
                 min_order_size_btc = Decimal(str(cfg.strategy.size_min))
-                exchange_pos_before, _, _ = await _fetch_exchange_position_retry(
-                    http=http,
-                    product_code=cfg.exchange.product_code,
-                    retries=position_fetch_retry,
-                    wait_sec=position_fetch_retry_wait_sec,
-                    context="shutdown_before",
+                if shutdown_fetch_grace_sec > 0:
+                    logger.info(
+                        "SHUTDOWN_FETCH_GRACE wait_sec={}",
+                        shutdown_fetch_grace_sec,
+                    )
+                    await asyncio.sleep(shutdown_fetch_grace_sec)
+
+                async def _fetch_shutdown_position(
+                    context: str,
+                ) -> tuple[Optional[Decimal], bool]:
+                    api_limited = False
+                    for fetch_attempt in range(1, position_fetch_retry + 1):
+                        try:
+                            positions = await http.get_positions(
+                                product_code=cfg.exchange.product_code
+                            )
+                        except Exception as exc:
+                            if _is_api_limit_error(exc):
+                                api_limited = True
+                            logger.warning(f"get_positions failed: {exc}")
+                            positions = None
+                        if positions is not None:
+                            net, _, _ = _positions_response_to_net(positions)
+                            if net is not None:
+                                if fetch_attempt > 1:
+                                    logger.info(
+                                        "get_positions recovered context={} attempt={} retries={}",
+                                        context,
+                                        fetch_attempt,
+                                        position_fetch_retry,
+                                    )
+                                return net, api_limited
+                            if _is_api_limit_response(positions):
+                                api_limited = True
+                            logger.warning(f"get_positions unexpected response: {positions}")
+                        if fetch_attempt < position_fetch_retry:
+                            logger.warning(
+                                "get_positions retry context={} attempt={} retries={} wait_sec={}",
+                                context,
+                                fetch_attempt,
+                                position_fetch_retry,
+                                position_fetch_retry_wait_sec,
+                            )
+                            await asyncio.sleep(position_fetch_retry_wait_sec)
+                    return None, api_limited
+
+                async def _try_shutdown_dust_normalize(
+                    *,
+                    residual_position_btc: Decimal,
+                    attempt: int,
+                ) -> bool:
+                    if not shutdown_dust_normalize_enabled:
+                        return False
+                    side = "long" if residual_position_btc > 0 else "short"
+                    plan = _dust_normalize_plan(
+                        side=side,
+                        size_btc=abs(residual_position_btc),
+                        min_order_size_btc=min_order_size_btc,
+                    )
+                    if plan is None:
+                        return False
+
+                    (leg1_side, leg1_size), (leg2_side, leg2_size) = plan
+                    logger.error(
+                        "SHUTDOWN_DUST_NORMALIZE_START residual_position_btc={} attempt={} "
+                        "leg1={} {} leg2={} {}",
+                        residual_position_btc,
+                        attempt,
+                        leg1_side,
+                        leg1_size,
+                        leg2_side,
+                        leg2_size,
+                    )
+                    try:
+                        close_board = await ensure_close_board(now)
+                        await executor.execute(
+                            [
+                                Action(
+                                    kind="close_market",
+                                    side=leg1_side,
+                                    size=leg1_size,
+                                    tag="shutdown_dust_norm1",
+                                )
+                            ],
+                            now=now,
+                            board=close_board,
+                        )
+                        await asyncio.sleep(shutdown_dust_normalize_wait_sec)
+                        await executor.poll(now=now, force_reconcile=True)
+                        await executor.execute(
+                            [
+                                Action(
+                                    kind="close_market",
+                                    side=leg2_side,
+                                    size=leg2_size,
+                                    tag="shutdown_dust_norm2",
+                                )
+                            ],
+                            now=now,
+                            board=close_board,
+                        )
+                        await asyncio.sleep(shutdown_dust_normalize_wait_sec)
+                        await executor.poll(now=now, force_reconcile=True)
+                        logger.error(
+                            "SHUTDOWN_DUST_NORMALIZE_SENT residual_position_btc={} attempt={}",
+                            residual_position_btc,
+                            attempt,
+                        )
+                        return True
+                    except Exception as exc:
+                        if not await _handle_known_action_exception(
+                            exc,
+                            context="shutdown_dust_normalize",
+                        ):
+                            _record_error("shutdown_dust_normalize")
+                            logger.exception(
+                                "SHUTDOWN_DUST_NORMALIZE_FAILED residual_position_btc={} attempt={}",
+                                residual_position_btc,
+                                attempt,
+                            )
+                        return False
+
+                exchange_pos_before, shutdown_before_api_limited = await _fetch_shutdown_position(
+                    context="shutdown_before"
                 )
                 exchange_pos_after = exchange_pos_before
                 shutdown_dust_blocked = False
                 if exchange_pos_before is None:
-                    _record_error("shutdown_position_unknown")
-                    logger.error(
-                        "SHUTDOWN_POSITION_UNKNOWN retries={} wait_sec={}",
-                        position_fetch_retry,
-                        position_fetch_retry_wait_sec,
-                    )
-                    await _send_webhook_alert(
-                        event="SHUTDOWN_POSITION_UNKNOWN",
-                        level="ERROR",
-                        detail=(
-                            f"position_fetch_retry={position_fetch_retry} "
-                            f"position_fetch_retry_wait_sec={position_fetch_retry_wait_sec}"
-                        ),
-                        cfg_path=cfg_path,
-                        product_code=cfg.exchange.product_code,
-                    )
-                elif exchange_pos_before != 0:
+                    confirm_deadline = time.monotonic() + shutdown_unknown_confirm_timeout_sec
+                    confirm_attempt = 0
+                    confirm_wait_sec = shutdown_unknown_confirm_interval_sec
+                    if shutdown_before_api_limited:
+                        confirm_wait_sec = min(
+                            shutdown_unknown_confirm_backoff_max_sec,
+                            shutdown_unknown_confirm_interval_sec
+                            * shutdown_unknown_confirm_backoff_multiplier,
+                        )
+                        logger.warning(
+                            "SHUTDOWN_POSITION_CONFIRM_BACKOFF reason=shutdown_before_api_limit "
+                            "wait_sec={} next_wait_sec={} multiplier={} max_wait_sec={}",
+                            shutdown_unknown_confirm_interval_sec,
+                            confirm_wait_sec,
+                            shutdown_unknown_confirm_backoff_multiplier,
+                            shutdown_unknown_confirm_backoff_max_sec,
+                        )
+                    while exchange_pos_before is None and time.monotonic() < confirm_deadline:
+                        confirm_attempt += 1
+                        logger.warning(
+                            "SHUTDOWN_POSITION_CONFIRM_WAIT attempt={} interval_sec={} timeout_sec={}",
+                            confirm_attempt,
+                            confirm_wait_sec,
+                            shutdown_unknown_confirm_timeout_sec,
+                        )
+                        await asyncio.sleep(confirm_wait_sec)
+                        exchange_pos_before, confirm_api_limited = await _fetch_shutdown_position(
+                            context=f"shutdown_confirm_{confirm_attempt}"
+                        )
+                        if exchange_pos_before is None:
+                            if confirm_api_limited:
+                                next_wait_sec = min(
+                                    shutdown_unknown_confirm_backoff_max_sec,
+                                    max(
+                                        confirm_wait_sec,
+                                        shutdown_unknown_confirm_interval_sec,
+                                    )
+                                    * shutdown_unknown_confirm_backoff_multiplier,
+                                )
+                                logger.warning(
+                                    "SHUTDOWN_POSITION_CONFIRM_BACKOFF reason=api_limit "
+                                    "attempt={} wait_sec={} next_wait_sec={} multiplier={} "
+                                    "max_wait_sec={}",
+                                    confirm_attempt,
+                                    confirm_wait_sec,
+                                    next_wait_sec,
+                                    shutdown_unknown_confirm_backoff_multiplier,
+                                    shutdown_unknown_confirm_backoff_max_sec,
+                                )
+                                confirm_wait_sec = next_wait_sec
+                            else:
+                                confirm_wait_sec = shutdown_unknown_confirm_interval_sec
+                    exchange_pos_after = exchange_pos_before
+                    if exchange_pos_before is None:
+                        _record_error("shutdown_position_unknown")
+                        logger.error(
+                            "SHUTDOWN_POSITION_UNKNOWN retries={} wait_sec={} confirm_timeout_sec={} "
+                            "backoff_multiplier={} backoff_max_sec={}",
+                            position_fetch_retry,
+                            position_fetch_retry_wait_sec,
+                            shutdown_unknown_confirm_timeout_sec,
+                            shutdown_unknown_confirm_backoff_multiplier,
+                            shutdown_unknown_confirm_backoff_max_sec,
+                        )
+                        await _send_webhook_alert(
+                            event="SHUTDOWN_POSITION_UNKNOWN",
+                            level="ERROR",
+                            detail=(
+                                f"position_fetch_retry={position_fetch_retry} "
+                                f"position_fetch_retry_wait_sec={position_fetch_retry_wait_sec} "
+                                f"confirm_timeout_sec={shutdown_unknown_confirm_timeout_sec} "
+                                "confirm_backoff_reason=api_limit_or_unknown"
+                            ),
+                            cfg_path=cfg_path,
+                            product_code=cfg.exchange.product_code,
+                        )
+                    exchange_pos_after = exchange_pos_before
+
+                if exchange_pos_before is not None and exchange_pos_before != 0:
                     for attempt in range(1, close_retry_max + 1):
                         if exchange_pos_after is None:
                             logger.warning(
@@ -1223,15 +1450,20 @@ async def _run_trade(
                                 attempt,
                             )
                             await asyncio.sleep(max(close_retry_wait_sec, position_fetch_retry_wait_sec))
-                            exchange_pos_after, _, _ = await _fetch_exchange_position_retry(
-                                http=http,
-                                product_code=cfg.exchange.product_code,
-                                retries=position_fetch_retry,
-                                wait_sec=position_fetch_retry_wait_sec,
-                                context=f"shutdown_retry_unknown_{attempt}",
+                            exchange_pos_after, _ = await _fetch_shutdown_position(
+                                context=f"shutdown_retry_unknown_{attempt}"
                             )
                             continue
                         if abs(exchange_pos_after) < min_order_size_btc:
+                            normalized = await _try_shutdown_dust_normalize(
+                                residual_position_btc=exchange_pos_after,
+                                attempt=attempt,
+                            )
+                            if normalized:
+                                exchange_pos_after, _ = await _fetch_shutdown_position(
+                                    context=f"shutdown_dust_norm_{attempt}"
+                                )
+                                continue
                             shutdown_dust_blocked = True
                             logger.error(
                                 "SHUTDOWN_CLOSE_DUST residual_position_btc={} min_order_size_btc={}",
@@ -1275,6 +1507,15 @@ async def _run_trade(
                                     attempt,
                                     exc,
                                 )
+                                normalized = await _try_shutdown_dust_normalize(
+                                    residual_position_btc=exchange_pos_after,
+                                    attempt=attempt,
+                                )
+                                if normalized:
+                                    exchange_pos_after, _ = await _fetch_shutdown_position(
+                                        context=f"shutdown_dust_err_norm_{attempt}"
+                                    )
+                                    continue
                                 await _send_webhook_alert(
                                     event="SHUTDOWN_CLOSE_DUST",
                                     level="ERROR",
@@ -1302,12 +1543,8 @@ async def _run_trade(
                                 )
                         await asyncio.sleep(close_retry_wait_sec)
                         await executor.poll(now=now, force_reconcile=True)
-                        exchange_pos_after, _, _ = await _fetch_exchange_position_retry(
-                            http=http,
-                            product_code=cfg.exchange.product_code,
-                            retries=position_fetch_retry,
-                            wait_sec=position_fetch_retry_wait_sec,
-                            context=f"shutdown_retry_{attempt}",
+                        exchange_pos_after, _ = await _fetch_shutdown_position(
+                            context=f"shutdown_retry_{attempt}"
                         )
                         if exchange_pos_after is None:
                             logger.warning(
@@ -1363,7 +1600,7 @@ async def _run_trade(
                                 cfg_path=cfg_path,
                                 product_code=cfg.exchange.product_code,
                             )
-                else:
+                elif exchange_pos_before == 0:
                     logger.info("SHUTDOWN_CLOSE_SKIP residual_position_btc=0")
                 await executor.poll(now=now, force_reconcile=True)
 
