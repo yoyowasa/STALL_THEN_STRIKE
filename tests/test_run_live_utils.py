@@ -6,6 +6,7 @@ from src.app.run_live import (
     _env_bool,
     _filter_actions_by_interval,
     _is_api_limit_error,
+    _is_irregular_order_error,
     _is_min_order_size_error,
     _is_self_trade_error,
     _positions_to_net,
@@ -141,6 +142,20 @@ def test_is_api_limit_error_true():
 def test_is_api_limit_error_false():
     exc = RuntimeError("send_market_order response missing id: {'status': -110}")
     assert _is_api_limit_error(exc) is False
+
+
+def test_is_irregular_order_error_true():
+    exc = RuntimeError(
+        "send_limit_order response missing id: {'status': -509, 'error_message': "
+        "'Your ordering has been limited due to submitting an irregular number of orders.', "
+        "'data': None}"
+    )
+    assert _is_irregular_order_error(exc) is True
+
+
+def test_is_irregular_order_error_false():
+    exc = RuntimeError("send_limit_order response missing id: {'status': -1}")
+    assert _is_irregular_order_error(exc) is False
 
 
 def test_is_min_order_size_error_true():

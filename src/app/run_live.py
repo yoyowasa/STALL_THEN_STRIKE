@@ -172,6 +172,20 @@ def _is_min_order_size_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_irregular_order_error(exc: BaseException) -> bool:
+    cur: BaseException | None = exc
+    visited: set[int] = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        msg = str(cur).lower()
+        if "irregular number of orders" in msg:
+            return True
+        if "-509" in msg and "status" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _dust_normalize_plan(
     *,
     side: str,
@@ -564,25 +578,33 @@ async def _run_trade(
         guard_cooldown_sec = _env_float("ENTRY_GUARD_COOLDOWN_SEC") or 0.0
         api_limit_backoff_sec = _env_float("LIVE_API_LIMIT_BACKOFF_SEC") or 1.5
         api_limit_backoff_sec = max(0.2, float(api_limit_backoff_sec))
+        irregular_order_backoff_sec = _env_float("LIVE_IRREGULAR_ORDER_BACKOFF_SEC") or 3.0
+        irregular_order_backoff_sec = max(0.5, float(irregular_order_backoff_sec))
         api_limit_halt_window_sec = _env_float("LIVE_API_LIMIT_HALT_WINDOW_SEC") or 30.0
         api_limit_halt_window_sec = max(1.0, float(api_limit_halt_window_sec))
         api_limit_halt_threshold = max(1, _env_int("LIVE_API_LIMIT_HALT_THRESHOLD", 25))
         api_limit_halt_cooldown_sec = _env_float("LIVE_API_LIMIT_HALT_COOLDOWN_SEC") or 30.0
         api_limit_halt_cooldown_sec = max(5.0, float(api_limit_halt_cooldown_sec))
         api_limit_halt_new_orders = _env_bool("LIVE_API_LIMIT_HALT_NEW_ORDERS", True)
+        irregular_halt_window_sec = _env_float("LIVE_IRREGULAR_HALT_WINDOW_SEC") or 120.0
+        irregular_halt_window_sec = max(5.0, float(irregular_halt_window_sec))
+        irregular_halt_threshold = max(1, _env_int("LIVE_IRREGULAR_HALT_THRESHOLD", 3))
+        irregular_halt_cooldown_sec = _env_float("LIVE_IRREGULAR_HALT_COOLDOWN_SEC") or 180.0
+        irregular_halt_cooldown_sec = max(10.0, float(irregular_halt_cooldown_sec))
+        irregular_halt_new_orders = _env_bool("LIVE_IRREGULAR_HALT_NEW_ORDERS", True)
 
         place_min_interval_sec = _env_float("LIVE_PLACE_MIN_INTERVAL_SEC")
         cancel_min_interval_sec = _env_float("LIVE_CANCEL_MIN_INTERVAL_SEC")
         close_min_interval_sec = _env_float("LIVE_CLOSE_MIN_INTERVAL_SEC")
         action_min_interval_by_kind: dict[str, float] = {
-            "place_limit": max(0.0, float(place_min_interval_sec if place_min_interval_sec is not None else 0.35)),
+            "place_limit": max(0.0, float(place_min_interval_sec if place_min_interval_sec is not None else 0.8)),
             "cancel_all_stall": max(
                 0.0,
-                float(cancel_min_interval_sec if cancel_min_interval_sec is not None else 0.5),
+                float(cancel_min_interval_sec if cancel_min_interval_sec is not None else 0.8),
             ),
             "close_market": max(
                 0.0,
-                float(close_min_interval_sec if close_min_interval_sec is not None else 0.8),
+                float(close_min_interval_sec if close_min_interval_sec is not None else 1.0),
             ),
         }
         dust_alert_interval_sec = _env_float("LIVE_DUST_ALERT_INTERVAL_SEC") or 120.0
@@ -770,8 +792,10 @@ async def _run_trade(
         dust_last_alert_mono = 0.0
         dust_normalize_last_attempt_mono = -1e9
         api_limit_recent_mono: deque[float] = deque()
-        api_limit_halt_until_mono = 0.0
-        api_limit_halt_last_log_mono = 0.0
+        irregular_order_recent_mono: deque[float] = deque()
+        new_order_halt_until_mono = 0.0
+        new_order_halt_reason = ""
+        new_order_halt_last_log_mono = 0.0
         action_last_sent_mono_by_kind: dict[str, float] = {}
         action_throttle_last_log_mono = 0.0
 
@@ -802,7 +826,8 @@ async def _run_trade(
                 )
 
         async def _handle_known_action_exception(exc: BaseException, *, context: str) -> bool:
-            nonlocal api_limit_halt_until_mono
+            nonlocal new_order_halt_until_mono
+            nonlocal new_order_halt_reason
             if _is_self_trade_error(exc):
                 logger.warning(
                     "{} self-trade detected; skip guard error increment err={}",
@@ -827,8 +852,9 @@ async def _run_trade(
                 )
                 if api_limit_halt_new_orders and recent_api_limit >= api_limit_halt_threshold:
                     new_until = now_mono + api_limit_halt_cooldown_sec
-                    if new_until > api_limit_halt_until_mono:
-                        api_limit_halt_until_mono = new_until
+                    if new_until > new_order_halt_until_mono:
+                        new_order_halt_until_mono = new_until
+                        new_order_halt_reason = "api_limit"
                         logger.error(
                             "API_LIMIT_HALT_ENTER context={} recent_api_limit={} window_sec={} cooldown_sec={}",
                             context,
@@ -843,6 +869,34 @@ async def _run_trade(
                     exc,
                 )
                 await asyncio.sleep(api_limit_backoff_sec)
+                return True
+            if _is_irregular_order_error(exc):
+                now_mono = time.monotonic()
+                irregular_order_recent_mono.append(now_mono)
+                recent_irregular = _trim_recent_errors(
+                    irregular_order_recent_mono,
+                    now_mono=now_mono,
+                    window_sec=irregular_halt_window_sec,
+                )
+                if irregular_halt_new_orders and recent_irregular >= irregular_halt_threshold:
+                    new_until = now_mono + irregular_halt_cooldown_sec
+                    if new_until > new_order_halt_until_mono:
+                        new_order_halt_until_mono = new_until
+                        new_order_halt_reason = "irregular_order"
+                        logger.error(
+                            "IRREGULAR_ORDER_HALT_ENTER context={} recent_irregular={} window_sec={} cooldown_sec={}",
+                            context,
+                            recent_irregular,
+                            irregular_halt_window_sec,
+                            irregular_halt_cooldown_sec,
+                        )
+                logger.error(
+                    "{} irregular-order detected; skip guard error increment and backoff {} sec err={}",
+                    context,
+                    irregular_order_backoff_sec,
+                    exc,
+                )
+                await asyncio.sleep(irregular_order_backoff_sec)
                 return True
             return False
 
@@ -1005,19 +1059,20 @@ async def _run_trade(
                                 dust_last_alert_mono = now_mono
                             await _maybe_normalize_dust(now=now, now_mono=now_mono, snap=snap)
 
-                        if api_limit_halt_new_orders and now_mono < api_limit_halt_until_mono:
+                        if now_mono < new_order_halt_until_mono:
                             blocked = [a for a in actions if a.kind == "place_limit"]
                             if blocked:
                                 actions = [a for a in actions if a.kind != "place_limit"]
                                 entry_guard_blocked_place_limit_total += len(blocked)
-                                entry_guard_enforce_last_reason = "api_limit_halt"
-                                if now_mono - api_limit_halt_last_log_mono >= 1.0:
+                                entry_guard_enforce_last_reason = f"{new_order_halt_reason}_halt"
+                                if now_mono - new_order_halt_last_log_mono >= 1.0:
                                     logger.warning(
-                                        "API_LIMIT_HALT_ACTIVE remaining_sec={} blocked_place_limit={}",
-                                        round(api_limit_halt_until_mono - now_mono, 3),
+                                        "NEW_ORDER_HALT_ACTIVE reason={} remaining_sec={} blocked_place_limit={}",
+                                        new_order_halt_reason,
+                                        round(new_order_halt_until_mono - now_mono, 3),
                                         len(blocked),
                                     )
-                                    api_limit_halt_last_log_mono = now_mono
+                                    new_order_halt_last_log_mono = now_mono
 
                         if any(a.kind == "place_limit" for a in actions):
                             guard_actual = _guard_actual(
