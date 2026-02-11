@@ -596,6 +596,26 @@ async def _run_trade(
         api_limit_halt_cooldown_sec = _env_float("LIVE_API_LIMIT_HALT_COOLDOWN_SEC") or 30.0
         api_limit_halt_cooldown_sec = max(5.0, float(api_limit_halt_cooldown_sec))
         api_limit_halt_new_orders = _env_bool("LIVE_API_LIMIT_HALT_NEW_ORDERS", True)
+        close_api_limit_cooldown_sec = _env_float("LIVE_CLOSE_API_LIMIT_COOLDOWN_SEC") or 3.0
+        close_api_limit_cooldown_sec = max(0.5, float(close_api_limit_cooldown_sec))
+        close_api_limit_cooldown_multiplier = (
+            _env_float("LIVE_CLOSE_API_LIMIT_COOLDOWN_MULTIPLIER") or 1.7
+        )
+        close_api_limit_cooldown_multiplier = max(1.0, float(close_api_limit_cooldown_multiplier))
+        close_api_limit_cooldown_max_sec = (
+            _env_float("LIVE_CLOSE_API_LIMIT_COOLDOWN_MAX_SEC") or 20.0
+        )
+        close_api_limit_cooldown_max_sec = max(
+            close_api_limit_cooldown_sec,
+            float(close_api_limit_cooldown_max_sec),
+        )
+        close_api_limit_halt_warn_interval_sec = (
+            _env_float("LIVE_CLOSE_API_LIMIT_HALT_WARN_INTERVAL_SEC") or 1.0
+        )
+        close_api_limit_halt_warn_interval_sec = max(
+            0.2,
+            float(close_api_limit_halt_warn_interval_sec),
+        )
         irregular_halt_window_sec = _env_float("LIVE_IRREGULAR_HALT_WINDOW_SEC") or 120.0
         irregular_halt_window_sec = max(5.0, float(irregular_halt_window_sec))
         irregular_halt_threshold = max(1, _env_int("LIVE_IRREGULAR_HALT_THRESHOLD", 3))
@@ -806,6 +826,9 @@ async def _run_trade(
         new_order_halt_until_mono = 0.0
         new_order_halt_reason = ""
         new_order_halt_last_log_mono = 0.0
+        close_api_limit_halt_until_mono = 0.0
+        close_api_limit_consecutive = 0
+        close_api_limit_halt_last_log_mono = 0.0
         action_last_sent_mono_by_kind: dict[str, float] = {}
         action_throttle_last_log_mono = 0.0
 
@@ -835,9 +858,16 @@ async def _run_trade(
                     executor.active_order_count(tag=strategy.tag),
                 )
 
-        async def _handle_known_action_exception(exc: BaseException, *, context: str) -> bool:
+        async def _handle_known_action_exception(
+            exc: BaseException,
+            *,
+            context: str,
+            contains_close_market: bool = False,
+        ) -> bool:
             nonlocal new_order_halt_until_mono
             nonlocal new_order_halt_reason
+            nonlocal close_api_limit_halt_until_mono
+            nonlocal close_api_limit_consecutive
             if _is_self_trade_error(exc):
                 logger.warning(
                     "{} self-trade detected; skip guard error increment err={}",
@@ -872,6 +902,25 @@ async def _run_trade(
                             api_limit_halt_window_sec,
                             api_limit_halt_cooldown_sec,
                         )
+                if contains_close_market:
+                    close_api_limit_consecutive += 1
+                    hold_sec = close_api_limit_cooldown_sec * (
+                        close_api_limit_cooldown_multiplier ** (close_api_limit_consecutive - 1)
+                    )
+                    hold_sec = min(close_api_limit_cooldown_max_sec, hold_sec)
+                    close_until = now_mono + hold_sec
+                    if close_until > close_api_limit_halt_until_mono:
+                        close_api_limit_halt_until_mono = close_until
+                    logger.warning(
+                        "CLOSE_API_LIMIT_HALT_ENTER context={} consecutive={} hold_sec={} remaining_sec={} "
+                        "multiplier={} max_sec={}",
+                        context,
+                        close_api_limit_consecutive,
+                        round(hold_sec, 3),
+                        round(max(0.0, close_api_limit_halt_until_mono - now_mono), 3),
+                        close_api_limit_cooldown_multiplier,
+                        close_api_limit_cooldown_max_sec,
+                    )
                 logger.warning(
                     "{} api-limit detected; skip guard error increment and backoff {} sec err={}",
                     context,
@@ -1118,6 +1167,24 @@ async def _run_trade(
                                     logger.info('ENTRY_GUARD_ENFORCE pass=true reason=""')
                                 entry_guard_last_pass = True
 
+                        if now_mono < close_api_limit_halt_until_mono:
+                            blocked_close = [a for a in actions if a.kind == "close_market"]
+                            if blocked_close:
+                                actions = [a for a in actions if a.kind != "close_market"]
+                                if (
+                                    now_mono - close_api_limit_halt_last_log_mono
+                                ) >= close_api_limit_halt_warn_interval_sec:
+                                    logger.warning(
+                                        "CLOSE_API_LIMIT_HALT_ACTIVE remaining_sec={} blocked_close_market={} "
+                                        "consecutive={}",
+                                        round(close_api_limit_halt_until_mono - now_mono, 3),
+                                        len(blocked_close),
+                                        close_api_limit_consecutive,
+                                    )
+                                    close_api_limit_halt_last_log_mono = now_mono
+                        elif close_api_limit_consecutive > 0:
+                            close_api_limit_consecutive = 0
+
                         actions, blocked_by_interval = _filter_actions_by_interval(
                             actions,
                             now_mono=now_mono,
@@ -1132,10 +1199,17 @@ async def _run_trade(
                             )
                             action_throttle_last_log_mono = now_mono
 
+                        contains_close_market = any(a.kind == "close_market" for a in actions)
                         try:
                             await executor.execute(actions, now=now, board=snap)
+                            if contains_close_market and close_api_limit_consecutive > 0:
+                                close_api_limit_consecutive = 0
                         except Exception as exc:
-                            if not await _handle_known_action_exception(exc, context="execute_actions"):
+                            if not await _handle_known_action_exception(
+                                exc,
+                                context="execute_actions",
+                                contains_close_market=contains_close_market,
+                            ):
                                 _record_error("execute_actions")
                                 logger.exception("注文実行で例外が発生しました。")
 
