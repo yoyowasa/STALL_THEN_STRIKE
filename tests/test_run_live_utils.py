@@ -2,6 +2,7 @@ from collections import deque
 from decimal import Decimal
 
 from src.app.run_live import (
+    _dust_normalize_plan,
     _env_bool,
     _is_api_limit_error,
     _is_min_order_size_error,
@@ -129,3 +130,40 @@ def test_is_min_order_size_error_true():
 def test_is_min_order_size_error_false():
     exc = RuntimeError("send_market_order response missing id: {'status': -159}")
     assert _is_min_order_size_error(exc) is False
+
+
+def test_dust_normalize_plan_for_long_dust():
+    plan = _dust_normalize_plan(
+        side="long",
+        size_btc=Decimal("0.0003"),
+        min_order_size_btc=Decimal("0.001"),
+    )
+    assert plan == (("SELL", Decimal("0.0013")), ("BUY", Decimal("0.001")))
+
+
+def test_dust_normalize_plan_for_short_dust():
+    plan = _dust_normalize_plan(
+        side="short",
+        size_btc=Decimal("0.0007"),
+        min_order_size_btc=Decimal("0.001"),
+    )
+    assert plan == (("BUY", Decimal("0.0017")), ("SELL", Decimal("0.001")))
+
+
+def test_dust_normalize_plan_none_for_non_dust():
+    assert (
+        _dust_normalize_plan(
+            side="long",
+            size_btc=Decimal("0.001"),
+            min_order_size_btc=Decimal("0.001"),
+        )
+        is None
+    )
+    assert (
+        _dust_normalize_plan(
+            side="flat",
+            size_btc=Decimal("0.0004"),
+            min_order_size_btc=Decimal("0.001"),
+        )
+        is None
+    )

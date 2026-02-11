@@ -138,6 +138,23 @@ def _is_min_order_size_error(exc: BaseException) -> bool:
     return False
 
 
+def _dust_normalize_plan(
+    *,
+    side: str,
+    size_btc: Decimal,
+    min_order_size_btc: Decimal,
+) -> tuple[tuple[Side, Decimal], tuple[Side, Decimal]] | None:
+    if min_order_size_btc <= 0:
+        return None
+    if size_btc <= 0 or size_btc >= min_order_size_btc:
+        return None
+    if side == "long":
+        return ("SELL", size_btc + min_order_size_btc), ("BUY", min_order_size_btc)
+    if side == "short":
+        return ("BUY", size_btc + min_order_size_btc), ("SELL", min_order_size_btc)
+    return None
+
+
 def _resolve_alert_webhook_url() -> str:
     for key in (
         "LIVE_ALERT_WEBHOOK_URL",
@@ -451,6 +468,12 @@ async def _run_trade(
         api_limit_backoff_sec = max(0.2, float(api_limit_backoff_sec))
         dust_alert_interval_sec = _env_float("LIVE_DUST_ALERT_INTERVAL_SEC") or 120.0
         dust_alert_interval_sec = max(10.0, float(dust_alert_interval_sec))
+        dust_normalize_enabled = _env_bool("LIVE_DUST_NORMALIZE_ENABLED", True)
+        dust_normalize_cooldown_sec = _env_float("LIVE_DUST_NORMALIZE_COOLDOWN_SEC") or 180.0
+        dust_normalize_cooldown_sec = max(10.0, float(dust_normalize_cooldown_sec))
+        dust_normalize_wait_sec = _env_float("LIVE_DUST_NORMALIZE_WAIT_SEC") or 0.5
+        dust_normalize_wait_sec = max(0.1, float(dust_normalize_wait_sec))
+        min_order_size_btc = Decimal(str(cfg.strategy.size_min))
 
         metrics = RuntimeMetrics(
             latency_window_sec=guard_latency_window_sec,
@@ -626,6 +649,7 @@ async def _run_trade(
         entry_guard_blocked_place_limit_total = 0
         entry_guard_enforce_last_reason = ""
         dust_last_alert_mono = 0.0
+        dust_normalize_last_attempt_mono = -1e9
 
         def _check_consistency() -> bool:
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
@@ -652,6 +676,100 @@ async def _run_trade(
                     strategy.open_order_count,
                     executor.active_order_count(tag=strategy.tag),
                 )
+
+        async def _handle_known_action_exception(exc: BaseException, *, context: str) -> bool:
+            if _is_self_trade_error(exc):
+                logger.warning(
+                    "{} self-trade detected; skip guard error increment err={}",
+                    context,
+                    exc,
+                )
+                return True
+            if _is_min_order_size_error(exc):
+                logger.error(
+                    "{} minimum-order-size detected; skip guard error increment err={}",
+                    context,
+                    exc,
+                )
+                return True
+            if _is_api_limit_error(exc):
+                logger.warning(
+                    "{} api-limit detected; skip guard error increment and backoff {} sec err={}",
+                    context,
+                    api_limit_backoff_sec,
+                    exc,
+                )
+                await asyncio.sleep(api_limit_backoff_sec)
+                return True
+            return False
+
+        async def _maybe_normalize_dust(
+            *,
+            now: datetime,
+            now_mono: float,
+            snap: BoardSnapshot,
+        ) -> None:
+            nonlocal dust_normalize_last_attempt_mono
+            if not dust_normalize_enabled:
+                return
+            if (now_mono - dust_normalize_last_attempt_mono) < dust_normalize_cooldown_sec:
+                return
+            if strategy.open_order_count > 0 or executor.active_order_count(tag=strategy.tag) > 0:
+                return
+
+            inv_state = inventory.state
+            plan = _dust_normalize_plan(
+                side=inv_state.side,
+                size_btc=inv_state.size,
+                min_order_size_btc=min_order_size_btc,
+            )
+            if plan is None:
+                return
+
+            (leg1_side, leg1_size), (leg2_side, leg2_size) = plan
+            dust_normalize_last_attempt_mono = now_mono
+            logger.warning(
+                "DUST_NORMALIZE_START side={} size_btc={} min_order_size_btc={} "
+                "leg1={} {} leg2={} {}",
+                inv_state.side,
+                inv_state.size,
+                min_order_size_btc,
+                leg1_side,
+                leg1_size,
+                leg2_side,
+                leg2_size,
+            )
+            try:
+                await executor.execute(
+                    [Action(kind="close_market", side=leg1_side, size=leg1_size, tag="dust_norm1")],
+                    now=now,
+                    board=snap,
+                )
+                await asyncio.sleep(dust_normalize_wait_sec)
+                await executor.poll(now=now, force_reconcile=True)
+                _sync_strategy_open_orders(now)
+
+                await executor.execute(
+                    [Action(kind="close_market", side=leg2_side, size=leg2_size, tag="dust_norm2")],
+                    now=now,
+                    board=snap,
+                )
+                await asyncio.sleep(dust_normalize_wait_sec)
+                await executor.poll(now=now, force_reconcile=True)
+                _sync_strategy_open_orders(now)
+                logger.warning(
+                    "DUST_NORMALIZE_SENT side={} size_btc={} leg1={} {} leg2={} {}",
+                    inv_state.side,
+                    inv_state.size,
+                    leg1_side,
+                    leg1_size,
+                    leg2_side,
+                    leg2_size,
+                )
+            except Exception as exc:
+                if not await _handle_known_action_exception(exc, context="dust_normalize"):
+                    _record_error("dust_normalize")
+                    logger.exception("dust_normalize execution failed.")
 
         async def _consume_ws_events(mux: WsMux) -> None:
             while True:
@@ -742,6 +860,7 @@ async def _run_trade(
                                     product_code=cfg.exchange.product_code,
                                 )
                                 dust_last_alert_mono = now_mono
+                            await _maybe_normalize_dust(now=now, now_mono=now_mono, snap=snap)
 
                         if any(a.kind == "place_limit" for a in actions):
                             guard_actual = _guard_actual(
@@ -780,27 +899,7 @@ async def _run_trade(
                         try:
                             await executor.execute(actions, now=now, board=snap)
                         except Exception as exc:
-                            if _is_self_trade_error(exc):
-                                logger.warning(
-                                    "execute_actions self-trade detected; skip guard error increment "
-                                    "err={}",
-                                    exc,
-                                )
-                            elif _is_min_order_size_error(exc):
-                                logger.error(
-                                    "execute_actions minimum-order-size detected; "
-                                    "skip guard error increment err={}",
-                                    exc,
-                                )
-                            elif _is_api_limit_error(exc):
-                                logger.warning(
-                                    "execute_actions api-limit detected; "
-                                    "skip guard error increment and backoff {} sec err={}",
-                                    api_limit_backoff_sec,
-                                    exc,
-                                )
-                                await asyncio.sleep(api_limit_backoff_sec)
-                            else:
+                            if not await _handle_known_action_exception(exc, context="execute_actions"):
                                 _record_error("execute_actions")
                                 logger.exception("注文実行で例外が発生しました。")
 
