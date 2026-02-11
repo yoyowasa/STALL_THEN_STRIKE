@@ -3,6 +3,8 @@ from decimal import Decimal
 
 from src.app.run_live import (
     _env_bool,
+    _is_api_limit_error,
+    _is_min_order_size_error,
     _is_self_trade_error,
     _positions_to_net,
     _resolve_alert_webhook_url,
@@ -101,3 +103,29 @@ def test_is_self_trade_error_true():
 def test_is_self_trade_error_false():
     exc = RuntimeError("send_market_order response missing id: {'status': -1}")
     assert _is_self_trade_error(exc) is False
+
+
+def test_is_api_limit_error_true():
+    exc = RuntimeError(
+        "send_market_order response missing id: {'status': -1, 'error_message': "
+        "'Over API limit per period, per IP address', 'data': None}"
+    )
+    assert _is_api_limit_error(exc) is True
+
+
+def test_is_api_limit_error_false():
+    exc = RuntimeError("send_market_order response missing id: {'status': -110}")
+    assert _is_api_limit_error(exc) is False
+
+
+def test_is_min_order_size_error_true():
+    exc = RuntimeError(
+        "send_market_order response missing id: {'status': -110, 'error_message': "
+        "'The minimum order size is 0.001 BTC.', 'data': None}"
+    )
+    assert _is_min_order_size_error(exc) is True
+
+
+def test_is_min_order_size_error_false():
+    exc = RuntimeError("send_market_order response missing id: {'status': -159}")
+    assert _is_min_order_size_error(exc) is False

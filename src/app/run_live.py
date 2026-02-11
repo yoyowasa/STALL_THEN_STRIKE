@@ -110,6 +110,34 @@ def _is_self_trade_error(exc: BaseException) -> bool:
     return False
 
 
+def _is_api_limit_error(exc: BaseException) -> bool:
+    cur: BaseException | None = exc
+    visited: set[int] = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        msg = str(cur).lower()
+        if "over api limit" in msg:
+            return True
+        if "-1" in msg and "status" in msg and "api limit" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _is_min_order_size_error(exc: BaseException) -> bool:
+    cur: BaseException | None = exc
+    visited: set[int] = set()
+    while cur is not None and id(cur) not in visited:
+        visited.add(id(cur))
+        msg = str(cur).lower()
+        if "minimum order size" in msg:
+            return True
+        if "-110" in msg and "status" in msg:
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
 def _resolve_alert_webhook_url() -> str:
     for key in (
         "LIVE_ALERT_WEBHOOK_URL",
@@ -419,6 +447,10 @@ async def _run_trade(
             _env_float("ENTRY_GUARD_CONSISTENCY_CHECK_INTERVAL_SEC") or 1.0
         )
         guard_cooldown_sec = _env_float("ENTRY_GUARD_COOLDOWN_SEC") or 0.0
+        api_limit_backoff_sec = _env_float("LIVE_API_LIMIT_BACKOFF_SEC") or 1.5
+        api_limit_backoff_sec = max(0.2, float(api_limit_backoff_sec))
+        dust_alert_interval_sec = _env_float("LIVE_DUST_ALERT_INTERVAL_SEC") or 120.0
+        dust_alert_interval_sec = max(10.0, float(dust_alert_interval_sec))
 
         metrics = RuntimeMetrics(
             latency_window_sec=guard_latency_window_sec,
@@ -593,6 +625,7 @@ async def _run_trade(
         entry_guard_last_log = 0.0
         entry_guard_blocked_place_limit_total = 0
         entry_guard_enforce_last_reason = ""
+        dust_last_alert_mono = 0.0
 
         def _check_consistency() -> bool:
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
@@ -686,6 +719,30 @@ async def _run_trade(
                         last_snap = snap
                         actions, meta = strategy.on_board(snap, now=now)
 
+                        if meta.reason == "position_dust_below_min":
+                            inv_state = inventory.state
+                            if (now_mono - dust_last_alert_mono) >= dust_alert_interval_sec:
+                                logger.error(
+                                    "POSITION_DUST_BLOCK side={} size_btc={} min_order_size_btc={} reason={}",
+                                    inv_state.side,
+                                    inv_state.size,
+                                    cfg.strategy.size_min,
+                                    meta.reason,
+                                )
+                                await _send_webhook_alert(
+                                    event="POSITION_DUST_BLOCK",
+                                    level="ERROR",
+                                    detail=(
+                                        f"side={inv_state.side} "
+                                        f"size_btc={inv_state.size} "
+                                        f"min_order_size_btc={cfg.strategy.size_min} "
+                                        f"reason={meta.reason}"
+                                    ),
+                                    cfg_path=cfg_path,
+                                    product_code=cfg.exchange.product_code,
+                                )
+                                dust_last_alert_mono = now_mono
+
                         if any(a.kind == "place_limit" for a in actions):
                             guard_actual = _guard_actual(
                                 engine=engine,
@@ -729,9 +786,23 @@ async def _run_trade(
                                     "err={}",
                                     exc,
                                 )
+                            elif _is_min_order_size_error(exc):
+                                logger.error(
+                                    "execute_actions minimum-order-size detected; "
+                                    "skip guard error increment err={}",
+                                    exc,
+                                )
+                            elif _is_api_limit_error(exc):
+                                logger.warning(
+                                    "execute_actions api-limit detected; "
+                                    "skip guard error increment and backoff {} sec err={}",
+                                    api_limit_backoff_sec,
+                                    exc,
+                                )
+                                await asyncio.sleep(api_limit_backoff_sec)
                             else:
                                 _record_error("execute_actions")
-                            logger.exception("注文実行で例外が発生しました。")
+                                logger.exception("注文実行で例外が発生しました。")
 
                         await executor.poll(now=now)
                         _sync_strategy_open_orders(now)
@@ -787,13 +858,33 @@ async def _run_trade(
                 close_retry_max = max(1, _env_int("LIVE_CLOSE_MAX_RETRY", 3))
                 close_retry_wait_sec = _env_float("LIVE_CLOSE_RETRY_WAIT_SEC") or 0.7
                 close_retry_wait_sec = max(0.2, float(close_retry_wait_sec))
+                min_order_size_btc = Decimal(str(cfg.strategy.size_min))
                 exchange_pos_before, _, _ = await _fetch_exchange_position(
                     http=http,
                     product_code=cfg.exchange.product_code,
                 )
                 exchange_pos_after = exchange_pos_before
+                shutdown_dust_blocked = False
                 if exchange_pos_before != 0:
                     for attempt in range(1, close_retry_max + 1):
+                        if abs(exchange_pos_after) < min_order_size_btc:
+                            shutdown_dust_blocked = True
+                            logger.error(
+                                "SHUTDOWN_CLOSE_DUST residual_position_btc={} min_order_size_btc={}",
+                                exchange_pos_after,
+                                min_order_size_btc,
+                            )
+                            await _send_webhook_alert(
+                                event="SHUTDOWN_CLOSE_DUST",
+                                level="ERROR",
+                                detail=(
+                                    f"exchange_pos_after={exchange_pos_after} "
+                                    f"min_order_size_btc={min_order_size_btc}"
+                                ),
+                                cfg_path=cfg_path,
+                                product_code=cfg.exchange.product_code,
+                            )
+                            break
                         close_side: Side = "SELL" if exchange_pos_after > 0 else "BUY"
                         close_size = abs(exchange_pos_after)
                         try:
@@ -809,12 +900,42 @@ async def _run_trade(
                                 now=now,
                                 board=await ensure_close_board(now),
                             )
-                        except Exception:
-                            _record_error("shutdown_close_market")
-                            logger.exception(
-                                "終了処理の close_market で例外が発生しました。 "
-                                f"attempt={attempt}"
-                            )
+                        except Exception as exc:
+                            if _is_min_order_size_error(exc):
+                                shutdown_dust_blocked = True
+                                logger.error(
+                                    "SHUTDOWN_CLOSE_DUST residual_position_btc={} min_order_size_btc={} "
+                                    "attempt={} err={}",
+                                    exchange_pos_after,
+                                    min_order_size_btc,
+                                    attempt,
+                                    exc,
+                                )
+                                await _send_webhook_alert(
+                                    event="SHUTDOWN_CLOSE_DUST",
+                                    level="ERROR",
+                                    detail=(
+                                        f"exchange_pos_after={exchange_pos_after} "
+                                        f"min_order_size_btc={min_order_size_btc} "
+                                        f"attempt={attempt}"
+                                    ),
+                                    cfg_path=cfg_path,
+                                    product_code=cfg.exchange.product_code,
+                                )
+                                break
+                            if _is_api_limit_error(exc):
+                                logger.warning(
+                                    "shutdown close_market api-limit detected attempt={} err={}",
+                                    attempt,
+                                    exc,
+                                )
+                                await asyncio.sleep(max(close_retry_wait_sec, api_limit_backoff_sec))
+                            else:
+                                _record_error("shutdown_close_market")
+                                logger.exception(
+                                    "終了処理の close_market で例外が発生しました。 "
+                                    f"attempt={attempt}"
+                                )
                         await asyncio.sleep(close_retry_wait_sec)
                         await executor.poll(now=now, force_reconcile=True)
                         exchange_pos_after, _, _ = await _fetch_exchange_position(
@@ -829,22 +950,28 @@ async def _run_trade(
                         if exchange_pos_after == 0:
                             break
                     if exchange_pos_after != 0:
-                        _record_error("shutdown_close_failed")
-                        logger.error(
-                            "SHUTDOWN_CLOSE_FAILED residual_position_btc={}",
-                            exchange_pos_after,
-                        )
-                        await _send_webhook_alert(
-                            event="SHUTDOWN_CLOSE_FAILED",
-                            level="ERROR",
-                            detail=(
-                                f"exchange_pos_before={exchange_pos_before} "
-                                f"exchange_pos_after={exchange_pos_after} "
-                                f"close_retry_max={close_retry_max}"
-                            ),
-                            cfg_path=cfg_path,
-                            product_code=cfg.exchange.product_code,
-                        )
+                        if shutdown_dust_blocked:
+                            logger.error(
+                                "SHUTDOWN_CLOSE_DUST_RESIDUAL residual_position_btc={}",
+                                exchange_pos_after,
+                            )
+                        else:
+                            _record_error("shutdown_close_failed")
+                            logger.error(
+                                "SHUTDOWN_CLOSE_FAILED residual_position_btc={}",
+                                exchange_pos_after,
+                            )
+                            await _send_webhook_alert(
+                                event="SHUTDOWN_CLOSE_FAILED",
+                                level="ERROR",
+                                detail=(
+                                    f"exchange_pos_before={exchange_pos_before} "
+                                    f"exchange_pos_after={exchange_pos_after} "
+                                    f"close_retry_max={close_retry_max}"
+                                ),
+                                cfg_path=cfg_path,
+                                product_code=cfg.exchange.product_code,
+                            )
                 else:
                     logger.info("SHUTDOWN_CLOSE_SKIP residual_position_btc=0")
                 await executor.poll(now=now, force_reconcile=True)

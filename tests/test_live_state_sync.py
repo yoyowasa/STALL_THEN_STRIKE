@@ -2,9 +2,10 @@ from datetime import datetime, timezone
 from decimal import Decimal
 
 from src.config.loader import RiskConfig, StallStrategyConfig
-from src.engine.inventory import InventoryManager
+from src.engine.inventory import FillEvent, InventoryManager
 from src.engine.live_executor import LiveExecutor
 from src.engine.strategy_stall import StallThenStrikeStrategy
+from src.types.dto import BoardSnapshot
 
 
 def _build_strategy() -> StallThenStrikeStrategy:
@@ -120,3 +121,34 @@ def test_live_executor_keeps_tag_for_late_event_annotation():
         }
     )
     assert enriched.get("tag") == "stall"
+
+
+def test_strategy_dust_position_does_not_emit_close_market(monkeypatch):
+    monkeypatch.delenv("AB_EXPECT_CA_THRESHOLD", raising=False)
+    strategy = _build_strategy()
+    now = datetime.now(tz=timezone.utc)
+
+    fill = FillEvent(
+        ts=now,
+        order_id="JRF-DUST-001",
+        side="BUY",
+        price=Decimal("100"),
+        size=Decimal("0.00077"),
+        tag="stall",
+    )
+    strategy.inventory.apply_fill(fill)
+    strategy.on_fill(fill)
+
+    board = BoardSnapshot(
+        ts=now,
+        best_bid_price=Decimal("90"),
+        best_bid_size=Decimal("1"),
+        best_ask_price=Decimal("91"),
+        best_ask_size=Decimal("1"),
+        best_age_ms=300,
+        spread_ticks=1,
+    )
+    actions, meta = strategy.on_board(board, now=now)
+
+    assert meta.reason == "position_dust_below_min"
+    assert all(a.kind != "close_market" for a in actions)

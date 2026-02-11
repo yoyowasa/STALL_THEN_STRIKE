@@ -76,6 +76,7 @@ class StallThenStrikeStrategy:
         self.tick_size = tick_size
         self.inventory = inventory
         self.tag = tag
+        self._min_order_size = Decimal(str(self.cfg.size_min))
 
         self._open: dict[str, _OpenOrder] = {}
         self._orders_until: Optional[datetime] = None
@@ -257,12 +258,17 @@ class StallThenStrikeStrategy:
             if self._open:
                 self._append_cancel_once(actions)
             if inv.side != "flat":
-                close_side: Side = "SELL" if inv.side == "long" else "BUY"
-                actions.append(Action(kind="close_market", side=close_side, size=inv.size, tag="risk"))
+                if inv.size >= self._min_order_size:
+                    close_side: Side = "SELL" if inv.side == "long" else "BUY"
+                    actions.append(Action(kind="close_market", side=close_side, size=inv.size, tag="risk"))
             meta = DecisionMeta(
                 ts=now,
                 decision_type="kill",
-                reason="risk limit reached",
+                reason=(
+                    "risk_limit_reached"
+                    if (inv.side == "flat" or inv.size >= self._min_order_size)
+                    else "risk_limit_with_dust_position"
+                ),
                 actions=actions,
                 best_age_ms=board.best_age_ms,
                 spread_ticks=board.spread_ticks,
@@ -306,6 +312,20 @@ class StallThenStrikeStrategy:
             if should_close and inv.size > 0:
                 if self._open:
                     self._append_cancel_once(actions)
+
+                if inv.size < self._min_order_size:
+                    self._close_in_flight = False
+                    self._close_requested_at = None
+                    meta = DecisionMeta(
+                        ts=now,
+                        decision_type="hold",
+                        reason="position_dust_below_min",
+                        actions=actions,
+                        best_age_ms=board.best_age_ms,
+                        spread_ticks=board.spread_ticks,
+                        inventory_btc=self.inventory.position_btc,
+                    )
+                    return actions, meta
 
                 allow_close = (not self._close_in_flight) or (
                     self._close_requested_at is not None
