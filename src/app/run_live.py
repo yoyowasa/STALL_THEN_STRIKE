@@ -303,6 +303,15 @@ def _positions_to_net(positions: Any) -> tuple[Decimal, Optional[Decimal], int]:
     return net, avg_price, rows
 
 
+def _positions_response_to_net(
+    positions: Any,
+) -> tuple[Optional[Decimal], Optional[Decimal], int]:
+    if not isinstance(positions, list):
+        return None, None, 0
+    net, avg_price, rows = _positions_to_net(positions)
+    return net, avg_price, rows
+
+
 async def _fetch_exchange_position(
     *,
     http: BitflyerHttp,
@@ -317,6 +326,61 @@ async def _fetch_exchange_position(
     if not isinstance(positions, list):
         logger.warning(f"get_positions unexpected response: {positions}")
     return net, avg_price, rows
+
+
+async def _fetch_exchange_position_known(
+    *,
+    http: BitflyerHttp,
+    product_code: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], int]:
+    try:
+        positions = await http.get_positions(product_code=product_code)
+    except Exception as exc:
+        logger.warning(f"get_positions failed: {exc}")
+        return None, None, 0
+    net, avg_price, rows = _positions_response_to_net(positions)
+    if net is None:
+        logger.warning(f"get_positions unexpected response: {positions}")
+        return None, None, 0
+    return net, avg_price, rows
+
+
+async def _fetch_exchange_position_retry(
+    *,
+    http: BitflyerHttp,
+    product_code: str,
+    retries: int,
+    wait_sec: float,
+    context: str,
+) -> tuple[Optional[Decimal], Optional[Decimal], int]:
+    retries = max(1, retries)
+    wait_sec = max(0.2, wait_sec)
+    last_rows = 0
+    for attempt in range(1, retries + 1):
+        net, avg_price, rows = await _fetch_exchange_position_known(
+            http=http,
+            product_code=product_code,
+        )
+        last_rows = rows
+        if net is not None:
+            if attempt > 1:
+                logger.info(
+                    "get_positions recovered context={} attempt={} retries={}",
+                    context,
+                    attempt,
+                    retries,
+                )
+            return net, avg_price, rows
+        if attempt < retries:
+            logger.warning(
+                "get_positions retry context={} attempt={} retries={} wait_sec={}",
+                context,
+                attempt,
+                retries,
+                wait_sec,
+            )
+            await asyncio.sleep(wait_sec)
+    return None, None, last_rows
 
 
 async def _sync_inventory_from_exchange(
@@ -957,15 +1021,54 @@ async def _run_trade(
                 close_retry_max = max(1, _env_int("LIVE_CLOSE_MAX_RETRY", 3))
                 close_retry_wait_sec = _env_float("LIVE_CLOSE_RETRY_WAIT_SEC") or 0.7
                 close_retry_wait_sec = max(0.2, float(close_retry_wait_sec))
+                position_fetch_retry = max(1, _env_int("LIVE_POSITION_FETCH_RETRY", 5))
+                position_fetch_retry_wait_sec = (
+                    _env_float("LIVE_POSITION_FETCH_RETRY_WAIT_SEC") or 1.0
+                )
+                position_fetch_retry_wait_sec = max(0.2, float(position_fetch_retry_wait_sec))
                 min_order_size_btc = Decimal(str(cfg.strategy.size_min))
-                exchange_pos_before, _, _ = await _fetch_exchange_position(
+                exchange_pos_before, _, _ = await _fetch_exchange_position_retry(
                     http=http,
                     product_code=cfg.exchange.product_code,
+                    retries=position_fetch_retry,
+                    wait_sec=position_fetch_retry_wait_sec,
+                    context="shutdown_before",
                 )
                 exchange_pos_after = exchange_pos_before
                 shutdown_dust_blocked = False
-                if exchange_pos_before != 0:
+                if exchange_pos_before is None:
+                    _record_error("shutdown_position_unknown")
+                    logger.error(
+                        "SHUTDOWN_POSITION_UNKNOWN retries={} wait_sec={}",
+                        position_fetch_retry,
+                        position_fetch_retry_wait_sec,
+                    )
+                    await _send_webhook_alert(
+                        event="SHUTDOWN_POSITION_UNKNOWN",
+                        level="ERROR",
+                        detail=(
+                            f"position_fetch_retry={position_fetch_retry} "
+                            f"position_fetch_retry_wait_sec={position_fetch_retry_wait_sec}"
+                        ),
+                        cfg_path=cfg_path,
+                        product_code=cfg.exchange.product_code,
+                    )
+                elif exchange_pos_before != 0:
                     for attempt in range(1, close_retry_max + 1):
+                        if exchange_pos_after is None:
+                            logger.warning(
+                                "SHUTDOWN_CLOSE_RETRY attempt={} residual_position_btc=unknown",
+                                attempt,
+                            )
+                            await asyncio.sleep(max(close_retry_wait_sec, position_fetch_retry_wait_sec))
+                            exchange_pos_after, _, _ = await _fetch_exchange_position_retry(
+                                http=http,
+                                product_code=cfg.exchange.product_code,
+                                retries=position_fetch_retry,
+                                wait_sec=position_fetch_retry_wait_sec,
+                                context=f"shutdown_retry_unknown_{attempt}",
+                            )
+                            continue
                         if abs(exchange_pos_after) < min_order_size_btc:
                             shutdown_dust_blocked = True
                             logger.error(
@@ -1037,10 +1140,19 @@ async def _run_trade(
                                 )
                         await asyncio.sleep(close_retry_wait_sec)
                         await executor.poll(now=now, force_reconcile=True)
-                        exchange_pos_after, _, _ = await _fetch_exchange_position(
+                        exchange_pos_after, _, _ = await _fetch_exchange_position_retry(
                             http=http,
                             product_code=cfg.exchange.product_code,
+                            retries=position_fetch_retry,
+                            wait_sec=position_fetch_retry_wait_sec,
+                            context=f"shutdown_retry_{attempt}",
                         )
+                        if exchange_pos_after is None:
+                            logger.warning(
+                                "SHUTDOWN_CLOSE_RETRY attempt={} residual_position_btc=unknown",
+                                attempt,
+                            )
+                            continue
                         logger.info(
                             "SHUTDOWN_CLOSE_RETRY attempt={} residual_position_btc={}",
                             attempt,
@@ -1048,7 +1160,25 @@ async def _run_trade(
                         )
                         if exchange_pos_after == 0:
                             break
-                    if exchange_pos_after != 0:
+                    if exchange_pos_after is None:
+                        _record_error("shutdown_close_position_unknown")
+                        logger.error(
+                            "SHUTDOWN_CLOSE_POSITION_UNKNOWN close_retry_max={} fetch_retry={}",
+                            close_retry_max,
+                            position_fetch_retry,
+                        )
+                        await _send_webhook_alert(
+                            event="SHUTDOWN_CLOSE_POSITION_UNKNOWN",
+                            level="ERROR",
+                            detail=(
+                                f"exchange_pos_before={exchange_pos_before} "
+                                f"close_retry_max={close_retry_max} "
+                                f"position_fetch_retry={position_fetch_retry}"
+                            ),
+                            cfg_path=cfg_path,
+                            product_code=cfg.exchange.product_code,
+                        )
+                    elif exchange_pos_after != 0:
                         if shutdown_dust_blocked:
                             logger.error(
                                 "SHUTDOWN_CLOSE_DUST_RESIDUAL residual_position_btc={}",

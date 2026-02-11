@@ -8,6 +8,7 @@ from src.app.run_live import (
     _is_min_order_size_error,
     _is_self_trade_error,
     _positions_to_net,
+    _positions_response_to_net,
     _resolve_alert_webhook_url,
     _trim_recent_errors,
 )
@@ -49,6 +50,27 @@ def test_positions_to_net_mixed():
     assert net == Decimal("0.1")
     assert avg == Decimal("80")
     assert rows == 2
+
+
+def test_positions_response_to_net_known_list():
+    net, avg, rows = _positions_response_to_net(
+        [
+            {"side": "BUY", "size": 0.2, "price": 100},
+            {"side": "SELL", "size": 0.1, "price": 120},
+        ]
+    )
+    assert net == Decimal("0.1")
+    assert avg == Decimal("80")
+    assert rows == 2
+
+
+def test_positions_response_to_net_unknown_response():
+    net, avg, rows = _positions_response_to_net(
+        {"status": -1, "error_message": "Over API limit per period, per user", "data": None}
+    )
+    assert net is None
+    assert avg is None
+    assert rows == 0
 
 
 def test_resolve_alert_webhook_url_precedence(monkeypatch):
