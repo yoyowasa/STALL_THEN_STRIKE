@@ -27,7 +27,13 @@ from src.app.run_paper import (
 )
 from src.config.loader import load_app_config
 from src.engine.inventory import FillEvent, InventoryManager
-from src.engine.live_executor import LiveExecutor
+from src.engine.live_executor import (
+    LiveExecutor,
+    api_limit_per_ip_cooldown_remaining_sec,
+    is_api_limit_per_ip_message,
+    register_api_limit_per_ip_backoff,
+    reset_api_limit_per_ip_backoff,
+)
 from src.engine.strategy_stall import StallThenStrikeStrategy
 from src.infra.http_bitflyer import BitflyerHttp
 from src.infra.orderbook_view import OrderBookView
@@ -596,6 +602,26 @@ async def _run_trade(
         api_limit_halt_cooldown_sec = _env_float("LIVE_API_LIMIT_HALT_COOLDOWN_SEC") or 30.0
         api_limit_halt_cooldown_sec = max(5.0, float(api_limit_halt_cooldown_sec))
         api_limit_halt_new_orders = _env_bool("LIVE_API_LIMIT_HALT_NEW_ORDERS", True)
+        place_api_limit_cooldown_sec = _env_float("LIVE_PLACE_API_LIMIT_COOLDOWN_SEC") or 2.5
+        place_api_limit_cooldown_sec = max(0.5, float(place_api_limit_cooldown_sec))
+        place_api_limit_cooldown_multiplier = (
+            _env_float("LIVE_PLACE_API_LIMIT_COOLDOWN_MULTIPLIER") or 1.8
+        )
+        place_api_limit_cooldown_multiplier = max(1.0, float(place_api_limit_cooldown_multiplier))
+        place_api_limit_cooldown_max_sec = (
+            _env_float("LIVE_PLACE_API_LIMIT_COOLDOWN_MAX_SEC") or 30.0
+        )
+        place_api_limit_cooldown_max_sec = max(
+            place_api_limit_cooldown_sec,
+            float(place_api_limit_cooldown_max_sec),
+        )
+        place_api_limit_halt_warn_interval_sec = (
+            _env_float("LIVE_PLACE_API_LIMIT_HALT_WARN_INTERVAL_SEC") or 1.0
+        )
+        place_api_limit_halt_warn_interval_sec = max(
+            0.2,
+            float(place_api_limit_halt_warn_interval_sec),
+        )
         close_api_limit_cooldown_sec = _env_float("LIVE_CLOSE_API_LIMIT_COOLDOWN_SEC") or 3.0
         close_api_limit_cooldown_sec = max(0.5, float(close_api_limit_cooldown_sec))
         close_api_limit_cooldown_multiplier = (
@@ -826,11 +852,15 @@ async def _run_trade(
         new_order_halt_until_mono = 0.0
         new_order_halt_reason = ""
         new_order_halt_last_log_mono = 0.0
+        place_api_limit_halt_until_mono = 0.0
+        place_api_limit_consecutive = 0
+        place_api_limit_halt_last_log_mono = 0.0
         close_api_limit_halt_until_mono = 0.0
         close_api_limit_consecutive = 0
         close_api_limit_halt_last_log_mono = 0.0
         action_last_sent_mono_by_kind: dict[str, float] = {}
         action_throttle_last_log_mono = 0.0
+        api_limit_per_ip_halt_last_log_mono = 0.0
 
         def _check_consistency() -> bool:
             return strategy.open_order_count == executor.active_order_count(tag=strategy.tag)
@@ -862,10 +892,13 @@ async def _run_trade(
             exc: BaseException,
             *,
             context: str,
+            contains_place_limit: bool = False,
             contains_close_market: bool = False,
         ) -> bool:
             nonlocal new_order_halt_until_mono
             nonlocal new_order_halt_reason
+            nonlocal place_api_limit_halt_until_mono
+            nonlocal place_api_limit_consecutive
             nonlocal close_api_limit_halt_until_mono
             nonlocal close_api_limit_consecutive
             if _is_self_trade_error(exc):
@@ -902,6 +935,25 @@ async def _run_trade(
                             api_limit_halt_window_sec,
                             api_limit_halt_cooldown_sec,
                         )
+                if contains_place_limit:
+                    place_api_limit_consecutive += 1
+                    hold_sec = place_api_limit_cooldown_sec * (
+                        place_api_limit_cooldown_multiplier ** (place_api_limit_consecutive - 1)
+                    )
+                    hold_sec = min(place_api_limit_cooldown_max_sec, hold_sec)
+                    place_until = now_mono + hold_sec
+                    if place_until > place_api_limit_halt_until_mono:
+                        place_api_limit_halt_until_mono = place_until
+                    logger.warning(
+                        "PLACE_API_LIMIT_HALT_ENTER context={} consecutive={} hold_sec={} remaining_sec={} "
+                        "multiplier={} max_sec={}",
+                        context,
+                        place_api_limit_consecutive,
+                        round(hold_sec, 3),
+                        round(max(0.0, place_api_limit_halt_until_mono - now_mono), 3),
+                        place_api_limit_cooldown_multiplier,
+                        place_api_limit_cooldown_max_sec,
+                    )
                 if contains_close_market:
                     close_api_limit_consecutive += 1
                     hold_sec = close_api_limit_cooldown_sec * (
@@ -921,6 +973,22 @@ async def _run_trade(
                         close_api_limit_cooldown_multiplier,
                         close_api_limit_cooldown_max_sec,
                     )
+                err_s = str(exc)
+                if is_api_limit_per_ip_message(err_s):
+                    sleep_sec = register_api_limit_per_ip_backoff(
+                        reason=context,
+                        err_msg=err_s,
+                        now_mono=now_mono,
+                    )
+                    logger.warning(
+                        "{} api-limit(per-ip) cooldown backoff {} sec err={}",
+                        context,
+                        round(sleep_sec, 3),
+                        exc,
+                    )
+                    await asyncio.sleep(max(0.0, sleep_sec))
+                    return True
+
                 logger.warning(
                     "{} api-limit detected; skip guard error increment and backoff {} sec err={}",
                     context,
@@ -1133,6 +1201,35 @@ async def _run_trade(
                                     )
                                     new_order_halt_last_log_mono = now_mono
 
+                        api_limit_per_ip_remaining_sec = api_limit_per_ip_cooldown_remaining_sec(
+                            now_mono=now_mono
+                        )
+                        if api_limit_per_ip_remaining_sec > 0:
+                            blocked_send = [
+                                a
+                                for a in actions
+                                if a.kind in {"place_limit", "close_market", "cancel_all_stall"}
+                            ]
+                            if blocked_send:
+                                actions = [
+                                    a
+                                    for a in actions
+                                    if a.kind not in {"place_limit", "close_market", "cancel_all_stall"}
+                                ]
+                                blocked_place = sum(
+                                    1 for a in blocked_send if a.kind == "place_limit"
+                                )
+                                if blocked_place > 0:
+                                    entry_guard_blocked_place_limit_total += blocked_place
+                                    entry_guard_enforce_last_reason = "api_limit_per_ip_cooldown"
+                                if (now_mono - api_limit_per_ip_halt_last_log_mono) >= 1.0:
+                                    logger.warning(
+                                        "API_LIMIT_PER_IP_COOLDOWN_ACTIVE remaining_sec={} blocked={}",
+                                        round(api_limit_per_ip_remaining_sec, 3),
+                                        [a.kind for a in blocked_send],
+                                    )
+                                    api_limit_per_ip_halt_last_log_mono = now_mono
+
                         if any(a.kind == "place_limit" for a in actions):
                             guard_actual = _guard_actual(
                                 engine=engine,
@@ -1185,6 +1282,26 @@ async def _run_trade(
                         elif close_api_limit_consecutive > 0:
                             close_api_limit_consecutive = 0
 
+                        if now_mono < place_api_limit_halt_until_mono:
+                            blocked_place = [a for a in actions if a.kind == "place_limit"]
+                            if blocked_place:
+                                actions = [a for a in actions if a.kind != "place_limit"]
+                                entry_guard_blocked_place_limit_total += len(blocked_place)
+                                entry_guard_enforce_last_reason = "place_api_limit_halt"
+                                if (
+                                    now_mono - place_api_limit_halt_last_log_mono
+                                ) >= place_api_limit_halt_warn_interval_sec:
+                                    logger.warning(
+                                        "PLACE_API_LIMIT_HALT_ACTIVE remaining_sec={} blocked_place_limit={} "
+                                        "consecutive={}",
+                                        round(place_api_limit_halt_until_mono - now_mono, 3),
+                                        len(blocked_place),
+                                        place_api_limit_consecutive,
+                                    )
+                                    place_api_limit_halt_last_log_mono = now_mono
+                        elif place_api_limit_consecutive > 0:
+                            place_api_limit_consecutive = 0
+
                         actions, blocked_by_interval = _filter_actions_by_interval(
                             actions,
                             now_mono=now_mono,
@@ -1199,15 +1316,28 @@ async def _run_trade(
                             )
                             action_throttle_last_log_mono = now_mono
 
+                        contains_place_limit = any(a.kind == "place_limit" for a in actions)
                         contains_close_market = any(a.kind == "close_market" for a in actions)
+                        contains_send_action = any(
+                            a.kind in {"place_limit", "close_market", "cancel_all_stall"}
+                            for a in actions
+                        )
                         try:
                             await executor.execute(actions, now=now, board=snap)
+                            if contains_send_action:
+                                reset_api_limit_per_ip_backoff(
+                                    reason="execute_actions_success",
+                                    now_mono=time.monotonic(),
+                                )
+                            if contains_place_limit and place_api_limit_consecutive > 0:
+                                place_api_limit_consecutive = 0
                             if contains_close_market and close_api_limit_consecutive > 0:
                                 close_api_limit_consecutive = 0
                         except Exception as exc:
                             if not await _handle_known_action_exception(
                                 exc,
                                 context="execute_actions",
+                                contains_place_limit=contains_place_limit,
                                 contains_close_market=contains_close_market,
                             ):
                                 _record_error("execute_actions")

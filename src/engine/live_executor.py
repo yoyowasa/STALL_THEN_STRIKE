@@ -13,6 +13,74 @@ from loguru import logger
 from src.infra.http_bitflyer import BitflyerHttp
 from src.types.dto import Action, BoardSnapshot, Side
 
+API_LIMIT_PER_IP_BACKOFF_MIN_SEC = 1.5
+API_LIMIT_PER_IP_BACKOFF_MAX_SEC = 30.0
+_API_LIMIT_PER_IP_BACKOFF_SEC = API_LIMIT_PER_IP_BACKOFF_MIN_SEC
+_API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO = 0.0
+
+
+def _is_api_limit_per_ip_message(msg: str) -> bool:
+    s = msg.lower()
+    return "over api limit" in s and "per ip address" in s
+
+
+def is_api_limit_per_ip_message(msg: str) -> bool:
+    return _is_api_limit_per_ip_message(msg)
+
+
+def api_limit_per_ip_cooldown_remaining_sec(*, now_mono: Optional[float] = None) -> float:
+    if now_mono is None:
+        now_mono = time.monotonic()
+    return max(0.0, _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO - now_mono)
+
+
+def is_api_limit_per_ip_cooldown_active(*, now_mono: Optional[float] = None) -> bool:
+    return api_limit_per_ip_cooldown_remaining_sec(now_mono=now_mono) > 0.0
+
+
+def register_api_limit_per_ip_backoff(
+    *,
+    reason: str,
+    err_msg: str,
+    now_mono: Optional[float] = None,
+) -> float:
+    global _API_LIMIT_PER_IP_BACKOFF_SEC
+    global _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO
+    if now_mono is None:
+        now_mono = time.monotonic()
+    _API_LIMIT_PER_IP_BACKOFF_SEC = min(
+        _API_LIMIT_PER_IP_BACKOFF_SEC * 2.0,
+        API_LIMIT_PER_IP_BACKOFF_MAX_SEC,
+    )
+    _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO = max(
+        _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO,
+        now_mono + _API_LIMIT_PER_IP_BACKOFF_SEC,
+    )
+    remaining_sec = api_limit_per_ip_cooldown_remaining_sec(now_mono=now_mono)
+    logger.warning(
+        "API_LIMIT_PER_IP_COOLDOWN_SET reason={} sleep_sec={} backoff_sec={} err={}",
+        reason,
+        round(remaining_sec, 3),
+        round(_API_LIMIT_PER_IP_BACKOFF_SEC, 3),
+        err_msg,
+    )
+    return remaining_sec
+
+
+def reset_api_limit_per_ip_backoff(*, reason: str, now_mono: Optional[float] = None) -> None:
+    global _API_LIMIT_PER_IP_BACKOFF_SEC
+    global _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO
+    if now_mono is None:
+        now_mono = time.monotonic()
+    if (
+        _API_LIMIT_PER_IP_BACKOFF_SEC == API_LIMIT_PER_IP_BACKOFF_MIN_SEC
+        and _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO <= now_mono
+    ):
+        return
+    _API_LIMIT_PER_IP_BACKOFF_SEC = API_LIMIT_PER_IP_BACKOFF_MIN_SEC
+    _API_LIMIT_PER_IP_COOLDOWN_UNTIL_MONO = 0.0
+    logger.info("API_LIMIT_PER_IP_COOLDOWN_RESET reason={}", reason)
+
 
 def _as_decimal(value: Any) -> Optional[Decimal]:
     if value is None:
@@ -62,6 +130,7 @@ class LiveExecutor:
         self._tag_seen_mono: dict[str, float] = {}
         self.tag_cache_ttl_sec = 3600.0
         self._last_reconcile_mono = 0.0
+        self._api_limit_per_ip_skip_last_log_mono = 0.0
         if self.http_min_interval_sec > 0:
             logger.info("LIVE_HTTP_MIN_INTERVAL_SEC={}", self.http_min_interval_sec)
 
@@ -269,6 +338,17 @@ class LiveExecutor:
             self._remember_tag(oid, tag)
 
     async def _fetch_active_orders(self, *, count: int = 100) -> list[dict[str, Any]]:
+        now_mono = time.monotonic()
+        remaining_sec = api_limit_per_ip_cooldown_remaining_sec(now_mono=now_mono)
+        if remaining_sec > 0:
+            if (now_mono - self._api_limit_per_ip_skip_last_log_mono) >= 1.0:
+                logger.warning(
+                    "get_child_orders skip due to API_LIMIT_PER_IP_COOLDOWN remaining_sec={}",
+                    round(remaining_sec, 3),
+                )
+                self._api_limit_per_ip_skip_last_log_mono = now_mono
+            return []
+
         try:
             await self._await_http_slot()
             active = await self.http.get_child_orders(
@@ -277,11 +357,26 @@ class LiveExecutor:
                 count=count,
             )
         except Exception as exc:
+            err_msg = str(exc)
+            if _is_api_limit_per_ip_message(err_msg):
+                register_api_limit_per_ip_backoff(
+                    reason="get_child_orders_exception",
+                    err_msg=err_msg,
+                    now_mono=time.monotonic(),
+                )
             logger.warning(f"get_child_orders failed: {exc}")
             return []
         if not isinstance(active, list):
+            err_msg = str(active)
+            if _is_api_limit_per_ip_message(err_msg):
+                register_api_limit_per_ip_backoff(
+                    reason="get_child_orders_response",
+                    err_msg=err_msg,
+                    now_mono=time.monotonic(),
+                )
             logger.warning(f"get_child_orders unexpected response: {active}")
             return []
+        reset_api_limit_per_ip_backoff(reason="get_child_orders_success", now_mono=time.monotonic())
         out: list[dict[str, Any]] = []
         for row in active:
             if isinstance(row, dict):
