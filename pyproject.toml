@@ -24,3 +24,16 @@ isort = "^5.13.2"
 [build-system]
 requires = ["poetry-core>=1.8.0"]
 build-backend = "poetry.core.masonry.api"
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
+follow_imports = "silent"
+show_error_codes = true
+pretty = true
+warn_unused_ignores = false
+check_untyped_defs = false
+ignore_errors = true
+namespace_packages = false
+disable_error_code = ["import-untyped", "unused-ignore"]
+exclude = '(^|/)(\.venv|venv|build|dist|\.git)/|(^|/)conftest\.py$'
